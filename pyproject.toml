@@ -1,0 +1,42 @@
+[project]
+name = "knee-oa"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "argparse>=1.4.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "openpyxl>=3.1.5",
+    "optuna>=4.8.0",
+    "optuna-dashboard>=0.20.0",
+    "pandas>=3.0.2",
+    "pydicom>=3.0.2",
+    "scikit-learn>=1.8.0",
+    "setuptools>=82.0.1",
+    "tensorboard>=2.20.0",
+    "tomli>=2.4.1",
+    "torch>=2.7.1",
+    "torchaudio>=2.7.1",
+    "torchvision>=0.22.1",
+    "tqdm>=4.67.3",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true  # This tells uv only to use this index for specific packages
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+torchvision = { index = "pytorch-cu118" }
+torchaudio = { index = "pytorch-cu118" }
+
+[tool.basedpyright]
+typeCheckingMode = "basic"
+reportGeneralTypeIssues = "none"
+reportPrivateImportUsage = "none"
