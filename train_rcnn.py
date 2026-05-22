@@ -1,5 +1,4 @@
 import argparse
-import copy
 import os
 from datetime import datetime
 from pathlib import Path
@@ -14,8 +13,8 @@ from dataset_handler import Fold_Handler, KLGradingDataset
 from models import RCNN
 from utils.logger import setup_logger
 from utils.seed_setup import set_seed
-from utils.transform import collate_fn, get_transform
-
+from utils.transform import collate_fn
+from utils.config import load_toml_config
 
 def train_rcnn(timestamp=None):
     set_seed(42)
@@ -23,18 +22,25 @@ def train_rcnn(timestamp=None):
 
     timestamp = timestamp if timestamp else datetime.now().strftime("%Y%m%d_%H%M%S")
     logger.info("Initializing RCNN training cross-validation")
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    root_dir = "./dataset"
-    grade_path = "./dataset/KLGrade_label_with_5fold.xlsx"
+    env_cfg = load_toml_config("configs/config.toml")
+
+    """
+    Hyperparameters:
+    - BATCH_SIZE: Stick with 2 to avoid OOM errors, and avoid 4 because GPU memory.
+    """
+    BATCH_SIZE = 2
+    NUM_EPOCHS = 30
+    LR = 2e-4
+    WEIGHT_DECAY = 1e-2
+
     try:
         full_dataset = KLGradingDataset(
-            root=root_dir,
-            transforms=get_transform(),
+            root=env_cfg["dataset"]["root_dir"],
             include_grades=True,
-            grade_path=grade_path,
+            grade_path=env_cfg["dataset"]["excel_file"],
         )
         logger.info(f"Total dataset images mounted successfully: {len(full_dataset)}")
     except Exception as e:
@@ -55,20 +61,9 @@ def train_rcnn(timestamp=None):
     logger.info(f"Locked Test Set (Fold 0): {len(test_idx)} images")
     logger.info(f"Cross-Validation Pool: {len(cv_idx)} images")
 
-    """
-    Hyperparameters:
-    - BATCH_SIZE: Stick with 2 to avoid OOM errors, and avoid 4 because GPU memory.
-    """
-    BATCH_SIZE = 2
-    LR = 2e-4
-    WEIGHT_DECAY = 1e-2
-    NUM_EPOCHS = 30
-    OPTIMIZER_NAME = "AdamW"
-
     cv_folds = fold_handler.get_cv_folds()
     for val_fold in cv_folds:
-        logger.info(f"{'-' * 10}Starting Fold {val_fold}/{len(cv_folds)}{'-' * 10}")
-
+        logger.info(f"{'-' * 15}Starting Fold {val_fold}/{len(cv_folds)}{'-' * 15}")
         run_name = f"runs/rcnn_{timestamp}_fold{val_fold}"
         writer = SummaryWriter(log_dir=run_name)
 
@@ -83,9 +78,7 @@ def train_rcnn(timestamp=None):
         train_subset = Subset(full_dataset, train_idx)
         val_subset = Subset(full_dataset, val_idx)
 
-        logger.info(
-            f"Fold {val_fold} | Training on: {len(train_subset)} images | Validating on: {len(val_subset)} images"
-        )
+        logger.info(f"Fold {val_fold} | Training on: {len(train_subset)} images | Validating on: {len(val_subset)} images")
 
         data_loader_train = DataLoader(
             train_subset,
@@ -111,32 +104,26 @@ def train_rcnn(timestamp=None):
 
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
-
-        scheduler = CosineAnnealingLR(
-            optimizer=optimizer, T_max=NUM_EPOCHS, eta_min=1e-6
-        )
+        scheduler = CosineAnnealingLR(optimizer=optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
 
         best_val_loss = float("inf")
-        best_model_state = None
+        best_epoch = 0
 
         for epoch in range(NUM_EPOCHS):
             model.train()
             train_loss = 0.0
 
-            loop = tqdm(
-                data_loader_train,
-                desc=f"Fold {val_fold} - Epoch [{epoch + 1}/{NUM_EPOCHS}]",
-            )
             # Training
+            loop = tqdm(data_loader_train, desc=f"Fold {val_fold} - Epoch [{epoch + 1}/{NUM_EPOCHS}]")
             for images, targets in loop:
                 # Move images and targets to GPU
                 images = list(image.to(device) for image in images)
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
+                optimizer.zero_grad()
                 loss_dict = model(images, targets)
                 losses = torch.stack([loss for loss in loss_dict.values()]).sum()
 
-                optimizer.zero_grad()
                 losses.backward()
                 optimizer.step()
 
@@ -158,54 +145,26 @@ def train_rcnn(timestamp=None):
                     val_loss += losses.item()
 
             avg_val_loss = val_loss / len(data_loader_val)
+            scheduler.step()
+
+            current_lr = scheduler.get_last_lr()[0]
+            logger.info(f"Epoch: {epoch + 1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {current_lr}")
+            writer.add_scalars("Loss", {"Train": avg_train_loss, "Validation": avg_val_loss}, epoch + 1)
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                best_model_state = copy.deepcopy(model.state_dict())
-                logger.info(
-                    f"New best model found for Fold {val_fold} at epoch {epoch + 1} with validation loss: {best_val_loss:.4f}"
-                )
+                best_epoch = epoch + 1
 
-            scheduler.step()
-            current_lr = scheduler.get_last_lr()[0]
+                os.makedirs("./weights", exist_ok=True)
+                save_path = Path("./weights/") / f"knee_rcnn_{timestamp}_fold{val_fold}.pth"
+                torch.save(model.state_dict(), save_path)
+                logger.info(f"New best model found for Fold {val_fold} at epoch {epoch + 1} with validation loss: {best_val_loss:.4f}")
 
-            logger.info(
-                f"Epoch: {epoch + 1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {current_lr}"
-            )
-
-            writer.add_scalars(
-                "Loss", {"Train": avg_train_loss, "Validation": avg_val_loss}, epoch + 1
-            )
-            writer.add_scalar("Learning_Rate", current_lr, epoch + 1)
-
-        os.makedirs("./weights", exist_ok=True)
-        save_path = Path("./weights/") / f"knee_rcnn_{timestamp}_fold{val_fold}.pth"
-
-        if best_model_state is not None:
-            torch.save(best_model_state, save_path)
-            logger.info(
-                f"Best model saved to {save_path} with validation loss: {best_val_loss:.4f}"
-            )
-        else:
-            torch.save(model.state_dict(), save_path)
-            logger.info(f"Final state saved directly to {save_path}")
-
-        writer.add_hparams(
-            hparam_dict={
-                "lr": LR,
-                "batch_size": BATCH_SIZE,
-                "weight_decay": WEIGHT_DECAY,
-                "optimizer": OPTIMIZER_NAME,
-                "epochs": NUM_EPOCHS,
-            },
-            metric_dict={"hparam/final_val_loss": avg_val_loss},
-        )
-
-        logger.info(f"Training complete! Fold {val_fold}")
         writer.close()
+        logger.info(f"Fold {val_fold} complete! Best Val Loss: {best_val_loss:.4f} at epoch {best_epoch}")
 
-    logger.info("Training RCNN completed for all folds")
-
+    logger.info(f"Training RCNN completed for all folds! Timestamp: {timestamp}")
+    return timestamp
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train RCNN model for knee grading")

@@ -35,8 +35,3 @@ index-strategy = "unsafe-best-match"
 torch = { index = "pytorch-cu118" }
 torchvision = { index = "pytorch-cu118" }
 torchaudio = { index = "pytorch-cu118" }
-
-[tool.basedpyright]
-typeCheckingMode = "basic"
-reportGeneralTypeIssues = "none"
-reportPrivateImportUsage = "none"

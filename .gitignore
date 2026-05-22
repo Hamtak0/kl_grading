@@ -14,6 +14,7 @@ devenv.local.yaml
 
 # byte-compiled / optimized / DLL files
 __pycache__/
+.python-version
 
 # no dataset included
 dataset/

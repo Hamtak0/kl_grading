@@ -18,8 +18,9 @@ from utils.seed_setup import set_seed
 from utils.logger import setup_logger
 from utils.metrics import create_confusion_matrix_figure
 from utils.transform import get_transform, unnormalize_tensor
+from utils.config import load_toml_config
 from dataset_handler import CachedKneeDataset, TransformWrapper, Fold_Handler
-from models import Classification_ResNet
+from models import Classification_ResNet, Classification_DenseNet
 
 def test_classification(timestamp_override=None, mode_override="BOTH"):
     set_seed(42)
@@ -32,8 +33,13 @@ def test_classification(timestamp_override=None, mode_override="BOTH"):
     MODE = mode_override.upper()
     logger.info(f"Ensemble timestamp: {timestamp}, mode: {MODE}")
 
+    env_cfg = load_toml_config("configs/config.toml")
     try:
-        cv_classifier_dataset = CachedKneeDataset()
+        cv_classifier_dataset = CachedKneeDataset(
+            cache_dir=env_cfg["dataset"]["cache_dir"],
+            root=env_cfg["dataset"]["root_dir"],
+            grade_path=env_cfg["dataset"]["excel_file"]
+        )
         logger.info(f"Successfully loaded CachedKneeDataset total size: {len(cv_classifier_dataset)}.")
     except Exception as e:
         logger.error(f"Failed to load dataset: {e}")
@@ -62,7 +68,8 @@ def test_classification(timestamp_override=None, mode_override="BOTH"):
 
     models = []
     for fold in fold_handler.get_cv_folds():
-        model = Classification_ResNet(num_classes=5, freeze_backbone=True).to(device)
+        # model = Classification_ResNet(num_classes=5, freeze_backbone=True).to(device)
+        model = Classification_DenseNet(num_classes=1).to(device)
         weight_path = Path(f"./weights/knee_class_{timestamp}_fold{fold}_{MODE}.pth")
         
         try:
@@ -96,15 +103,23 @@ def test_classification(timestamp_override=None, mode_override="BOTH"):
             
             all_labels.extend(labels.cpu().numpy())
 
-            ensemble_outputs = torch.zeros((images.size(0), 5)).to(device)
+            # ensemble_outputs = torch.zeros((images.size(0), 5)).to(device)
+            ensemble_outputs = torch.zeros((images.size(0),)).to(device)
 
             for model in models:
-                outputs = model(images)
-                probabilities = F.softmax(outputs, dim=1)
-                ensemble_outputs += probabilities
+                # outputs = model(images)
+                # probabilities = F.softmax(outputs, dim=1)
+                # ensemble_outputs += probabilities
+                outputs = model(images).squeeze(1)
+                ensemble_outputs += outputs
                 
-            avg_probabilities = ensemble_outputs / len(models)
-            confidences, predicted = torch.max(avg_probabilities.data, 1)
+            # avg_probabilities = ensemble_outputs / len(models)
+            # confidences, predicted = torch.max(avg_probabilities.data, 1)
+            avg_outputs = ensemble_outputs / len(models)
+            predicted = torch.round(avg_outputs).clamp(0, 4).long()
+
+            distances = torch.abs(avg_outputs - predicted.float())
+            confidences = torch.clamp(1.0 - distances, min=0.0, max=1.0)
             
             ensemble_preds.extend(predicted.cpu().numpy())
             ensemble_confs.extend(confidences.cpu().numpy())

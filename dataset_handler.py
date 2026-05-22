@@ -1,8 +1,7 @@
-'''
+"""
 Dataset class for the KL grading dataset.
-
 Special thanks to https://docs.pytorch.org/tutorials/intermediate/torchvision_tutorial.html
-'''
+"""
 
 import os
 import numpy as np
@@ -17,10 +16,10 @@ from torchvision.transforms.v2 import functional as F
 
 from utils.dicom_cut import read_dicom_image, mm_to_pixel
 from utils.cropping import cropping_points, center_to_corners
-from utils.crop_classification import extract_uniform_crop
+from utils.resize import extract_uniform_crop
 
 class KLGradingDataset(Dataset):
-    def __init__(self, root, transforms=None, include_grades=False, grade_path="./dataset/grades.json"):
+    def __init__(self, root, transforms=None, include_grades=True, grade_path="./dataset/grades.json"):
         self.root = root
         self.transforms = transforms
         self.include_grades = include_grades
@@ -53,11 +52,12 @@ class KLGradingDataset(Dataset):
                         continue
                     side = row['Side']
                     kl = row['KL']
+                    oa = row['OA']
                     fold = row['fold']
 
                     if pid not in self.labels_dict:
-                        self.labels_dict[pid] = {"L": -1, "R": -1} 
-                    self.labels_dict[pid][side] = kl
+                        self.labels_dict[pid] = {"L": [-1, -1], "R": [-1, -1]} 
+                    self.labels_dict[pid][side] = [kl, oa]
                     self.patient_to_fold[pid] = fold
 
             except Exception as e:
@@ -105,20 +105,26 @@ class KLGradingDataset(Dataset):
         # create labels (1 for left knee and 2 for right knee)
         labels = torch.tensor([1, 2], dtype=torch.int64)
 
-        kl_list = []
+        kl_list, oa_list = [], []
         if self.include_grades and hasattr(self, 'labels_dict'):
             # syntax: df.get(key, default=None) 
-            patient_grades = self.labels_dict.get(patient_id, {"L": -1, "R": -1})
+            patient_grades = self.labels_dict.get(patient_id, {"L": [-1, -1], "R": [-1, -1]})
             try:
                 for label in labels:
                     if label.item() == 1:  # Left knee
-                        kl_list.append(patient_grades.get("L", -1))
+                        grades = patient_grades.get("L", [-1, -1])
                     elif label.item() == 2:  # Right knee
-                        kl_list.append(patient_grades.get("R", -1))
+                        grades = patient_grades.get("R", [-1, -1])
+                    # grades = [kl, oa]
+                    kl_list.append(grades[0])
+                    oa_list.append(grades[1])
+                    
             except Exception as e:
                 raise Exception(f"Error while extracting KL grades for patient {patient_id}: {e}")
         else:
-            kl_list = [-1, -1] 
+            # none both left and right side 
+            kl_list = [-1, -1]
+            oa_list = [-1, -1]
 
         # metadata for torchvision see https://docs.pytorch.org/tutorials/intermediate/torchvision_tutorial.html#defining-the-dataset
         image_id = idx
@@ -134,6 +140,7 @@ class KLGradingDataset(Dataset):
         target["area"] = area
         target["iscrowd"] = iscrowd
         target["kl_grades"] = torch.tensor(kl_list, dtype=torch.long)
+        target["osteoarthritis"] = torch.tensor(oa_list, dtype=torch.long)
 
         if self.transforms is not None:
             img, target = self.transforms(img, target)
@@ -158,6 +165,7 @@ class ClassifierDataset(Dataset):
             _, target = base_subset[i]
             boxes = target['boxes'].numpy()
             kl_grades = target['kl_grades'].numpy() 
+            oa_grades = target['osteoarthritis'].numpy()
             
             original_idx = target['image_id'].item()  # Get the original index from the target
             if isinstance(self.base_subset, Subset):
@@ -167,9 +175,9 @@ class ClassifierDataset(Dataset):
 
             patient_id = dicom_filename.split(".")[0]
 
-            for side_idx, (box, kl_grade) in enumerate(zip(boxes, kl_grades)):
-                if kl_grade == -1:
-                    continue  # Skip if KL grade is missing for this knee
+            for side_idx, (box, kl_grade, oa_grades) in enumerate(zip(boxes, kl_grades, oa_grades)):
+                if kl_grade == -1 or oa_grades == -1:
+                    continue  # Skip if KL or OA grade is missing for this knee
 
                 # This block creates each samples with a unique patient ID that includes the side (L/R) for better tracking
                 side = "_L" if target['labels'][side_idx].item() == 1 else "_R"
@@ -179,6 +187,7 @@ class ClassifierDataset(Dataset):
                     "base_index": i,
                     "box": box,
                     "kl_grade": kl_grade,
+                    "oa_grade": oa_grades,
                     "patient_id": f"{patient_id}{side}",
                 })
 
@@ -190,17 +199,18 @@ class ClassifierDataset(Dataset):
         img_tensor, _ = self.base_subset[sample_info["base_index"]]
         
         # Crop exactly to the ground truth box
-        crop_tensor = extract_uniform_crop(img_tensor, sample_info["box"], target_size=224)
+        crop_tensor = extract_uniform_crop(img_tensor, sample_info["box"])
 
-        #! Because right now using ResNet which requires [3, 224, 224] therefore
-        #! the only_gray option doesn't need to be used
+        # Because right now using ResNet which requires [3, 224, 224] therefore
+        # the only_gray option doesn't need to be used
         if only_gray:
             crop_tensor = crop_tensor[0:1, :, :] # keep only grayscale
         
         # Classifiers expect long (integer) tensors for the target labels
         kl_grade = torch.tensor(sample_info["kl_grade"], dtype=torch.long)
+        oa_grade = torch.tensor(sample_info["oa_grade"], dtype=torch.long)
         
-        return crop_tensor, kl_grade, sample_info["patient_id"]  # Return patient ID for potential debugging or tracking
+        return crop_tensor, kl_grade, oa_grade, sample_info["patient_id"]  # Return patient ID for potential debugging or tracking
 
 class CachedKneeDataset(Dataset):
     """
@@ -235,7 +245,7 @@ class CachedKneeDataset(Dataset):
         if self.use_cache:
             # binary load is near-instantaneous and bypasses CPU bottlenecks
             data = torch.load(self.files[idx], weights_only=True)
-            return data["crop"], data["label"], data["patient_id"]
+            return data["crop"], data["label"], data["oa"], data["patient_id"]
         else:
             return self.fallback_dataset[idx]
 
@@ -250,7 +260,8 @@ class CachedKneeDataset(Dataset):
                     data = torch.load(f, weights_only=True)
                     self._mock_samples.append({
                         "patient_id": f.stem,
-                        "kl_grade": data["label"].item()
+                        "kl_grade": data["label"].item(),
+                        "oa_grade": data["oa"].item()
                     })
             return self._mock_samples
         else:
@@ -272,7 +283,7 @@ class TransformWrapper(Dataset):
         self.mode = mode
 
     def __getitem__(self, idx):
-        crop, label, pid = self.subset[idx]
+        crop, label, oa, pid = self.subset[idx]
         """* Note: handle the tranform inside the training loop instead (cpu bottleneck)
         if self.transform is not None:
             # Ensure it is a TV_Tensor so v2 transforms work perfectly
@@ -287,7 +298,7 @@ class TransformWrapper(Dataset):
         elif self.mode == "RIGHT" and is_left:
             crop = torch.flip(crop, dims=[2])
 
-        return crop, label, pid
+        return crop, label, oa, pid
 
     def __len__(self):
         return len(self.subset)

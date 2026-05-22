@@ -88,9 +88,18 @@ class Classification_CNN(nn.Module):
         return x
 
 class Classification_DenseNet(nn.Module):
-    def __init__(self, num_classes: int=5):
+    def __init__(self, num_classes: int = 5, freeze_backbone: bool = False):
         super(Classification_DenseNet, self).__init__()
-        self.model = densenet121(weights=DenseNet121_Weights.DEFAULT)
+        self.model = densenet121(weights=DenseNet121_Weights.DEFAULT) #, memory_efficient=True)
+
+        selected_layer = ["conv0", "norm0"] + [f"denseblock{i}" for i in range(1, 4)] + [f"transition{i}" for i in range(1, 4)]
+        if freeze_backbone:
+            for name, param in self.model.named_parameters():
+                for layer in selected_layer:
+                    if layer in name:
+                        param.requires_grad = False
+                        break
+
         self.model.classifier = nn.Linear(self.model.classifier.in_features, num_classes)
 
     def forward(self, x):

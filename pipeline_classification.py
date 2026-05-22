@@ -13,7 +13,7 @@ def run_stage(cmd, stage_name):
 
 def main():
     parser = argparse.ArgumentParser(description="Master Execution Orchestrator")
-    parser.add_argument("--config", type=str, default="configs/classification.toml", help="Path to baseline TOML configuration")
+    parser.add_argument("--config", type=str, default="configs/config.toml", help="Path to baseline TOML configuration")
     parser.add_argument("--mode", type=str, choices=["LEFT", "RIGHT", "BOTH"], help="Override the lateral standardization mode")
     parser.add_argument("--trials", type=int, help="Override the baseline Optuna search budget")
     args = parser.parse_args()

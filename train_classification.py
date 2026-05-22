@@ -1,6 +1,5 @@
 import argparse
 import json
-import copy
 import os
 import shutil
 from datetime import datetime
@@ -26,8 +25,9 @@ from utils.logger import setup_logger
 from utils.metrics import create_confusion_matrix_figure
 from utils.transform import get_transform, unnormalize_tensor
 from utils.seed_setup import set_seed
+from utils.config import load_toml_config
 from dataset_handler import CachedKneeDataset, TransformWrapper, Fold_Handler
-from models import Classification_ResNet
+from models import Classification_ResNet, Classification_DenseNet
 
 def train_classification(config_path=None, mode_override=None, timestamp_override=None) -> Tuple[Optional[str], Optional[str]]:
     set_seed(42) # Just same as kl grading seed cross-validation
@@ -38,37 +38,37 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
 
-    MODE = "LEFT" # "LEFT", "RIGHT", or "BOTH"
-    BATCH_SIZE = 2
-    NUM_EPOCHS = 50
+    env_cfg = load_toml_config("configs/config.toml")
+    MODE = env_cfg["experiment"]["lateral_mode"] # "LEFT", "RIGHT", or "BOTH"
+    BATCH_SIZE = env_cfg["training_defaults"]["batch_size"]
+    NUM_EPOCHS = env_cfg["training_defaults"]["num_epochs"]
     LR = 1.4768e-4
     WEIGHT_DECAY = 9.2914e-5
     ETA_MIN = 1.64e-6
-    LABEL_SMOOTHING = 0.25422
+    # LABEL_SMOOTHING = 0.25422
 
     if config_path and os.path.exists(config_path):
         logger.info(f"Loading parameters from {config_path}")
         with open(config_path, "r") as f:
-            cfg = json.load(f)
-        MODE = cfg.get("lateral_mode", MODE)
-        BATCH_SIZE = cfg.get("batch_size", BATCH_SIZE)
-        NUM_EPOCHS = cfg.get("epochs", NUM_EPOCHS)
-        LR = cfg.get("lr", LR)
-        WEIGHT_DECAY = cfg.get("weight_decay", WEIGHT_DECAY)
-        ETA_MIN = cfg.get("eta_min", ETA_MIN)
-        LABEL_SMOOTHING = cfg.get("label_smoothing", LABEL_SMOOTHING)
+            hyper_cfg = json.load(f)
+        MODE = hyper_cfg.get("lateral_mode", MODE)
+        BATCH_SIZE = hyper_cfg.get("batch_size", BATCH_SIZE)
+        NUM_EPOCHS = hyper_cfg.get("epochs", NUM_EPOCHS)
+        LR = hyper_cfg.get("lr", LR)
+        WEIGHT_DECAY = hyper_cfg.get("weight_decay", WEIGHT_DECAY)
+        ETA_MIN = hyper_cfg.get("eta_min", ETA_MIN)
+        # LABEL_SMOOTHING = hyper_cfg.get("label_smoothing", LABEL_SMOOTHING)
     
     if mode_override:
         MODE = mode_override.upper()
 
-    logger.info(f"Training parameters -> Mode: {MODE}, Batch: {BATCH_SIZE}, Epochs: {NUM_EPOCHS}, LR: {LR:.6f}, Smoothing: {LABEL_SMOOTHING:.4f}")
+    logger.info(f"Training parameters -> Mode: {MODE}, Batch: {BATCH_SIZE}, Epochs: {NUM_EPOCHS}, LR: {LR:.6f}")
 
-    root_dir = "./dataset"
     try:
         cv_classifier_dataset = CachedKneeDataset(
-            cache_dir="./dataset/cached_crops",
-            root=root_dir,
-            grade_path="./dataset/KLGrade_label_with_5fold.xlsx"
+            cache_dir=env_cfg["dataset"]["cache_dir"],
+            root=env_cfg["dataset"]["root_dir"],
+            grade_path=env_cfg["dataset"]["excel_file"]
         )
         logger.info(f"Total knees extracted: {len(cv_classifier_dataset)}")
     except Exception as e:
@@ -148,20 +148,17 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
         )
 
         train_labels = [cv_classifier_dataset.samples[i]['kl_grade'] for i in train_idx]
-        raw_weights = compute_class_weight(
-            class_weight='balanced',
-            classes=np.arange(5),
-            y=train_labels
-        )
-        soft_weights = np.sqrt(raw_weights)
-        weights_tensor = torch.tensor(soft_weights, dtype=torch.float).to(device)
+        raw_weights = compute_class_weight(class_weight='balanced', classes=np.arange(5), y=train_labels)
+        weights_tensor = torch.tensor(raw_weights, dtype=torch.float32).to(device)
 
         # model = Classification_CNN(num_classes=5, in_channels=1).to(device)
-        model = Classification_ResNet(num_classes=5).to(device)
-        criterion = nn.CrossEntropyLoss(
-            weight=weights_tensor,
-            label_smoothing=LABEL_SMOOTHING
-        )
+        # model = Classification_ResNet(num_classes=5).to(device)
+        model = Classification_DenseNet(num_classes=1).to(device)
+        # criterion = nn.CrossEntropyLoss(
+        #     weight=weights_tensor,
+        #     label_smoothing=LABEL_SMOOTHING
+        # )
+        criterion = nn.MSELoss(reduction='none')
         optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
         scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=ETA_MIN)
 
@@ -169,7 +166,8 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
         best_epoch = 0
         gpu_train_transform = get_transform(rotation=10, jitter=0.3, sharpness=2, is_train=True).to(device)
         gpu_val_transform = get_transform(rotation=0, jitter=0, sharpness=0, is_train=False).to(device)
-        grade_values = torch.arange(5, dtype=torch.float).to(device)
+
+        # scaler = torch.amp.GradScaler('cuda')
 
         for epoch in range(NUM_EPOCHS):
             model.train()
@@ -179,7 +177,7 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
 
             loop = tqdm(data_loader_train, desc=f"Fold {val_fold} - Epoch [{epoch+1}/{NUM_EPOCHS}]")
 
-            for images, labels, _ in loop:
+            for images, labels, oa, _ in loop:
                 # print("Labels in current batch:", labels)
                 images = images.to(device)
                 labels = labels.to(device)
@@ -187,18 +185,29 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
                 images = gpu_train_transform(images)
 
                 optimizer.zero_grad()
-                outputs = model(images)
 
-                loss = criterion(outputs, labels)
-                # probs = F.softmax(outputs, dim=1)
+                outputs = model(images).squeeze(1)
+                batch_weights = weights_tensor[labels.long()]
+                unweighted_loss = criterion(outputs, labels.float())
+                loss = (unweighted_loss * batch_weights).mean()
+                # with torch.amp.autocast('cuda'):
+                    # outputs = model(images)
+                    # loss = criterion(outputs, labels)
+                    # probs = F.softmax(outputs, dim=1)
 
+                # scaler.scale(loss).backward()
                 loss.backward()
+
+                # scaler.step(optimizer)
+                # scaler.update()
                 optimizer.step()
 
                 train_loss += loss.item() * images.size(0)
 
                 # Calculate Training Accuracy
-                _, predicted = torch.max(outputs.data, 1)
+                # _, predicted = torch.max(outputs.data, 1)
+                predicted = torch.round(outputs.data).clamp(0, 4).long()
+
                 total_train += labels.size(0)
                 correct_train += (predicted == labels).sum().item()
 
@@ -218,19 +227,24 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
             epoch_val_images = []
 
             with torch.no_grad():
-                for images, labels, patient_ids in data_loader_val:
+                for images, labels, oa, patient_ids in data_loader_val:
                     images = images.to(device)
                     labels = labels.to(device)
 
                     images = gpu_val_transform(images)
 
-                    outputs = model(images)
-                    loss_val = criterion(outputs, labels)
-                    probs_val = F.softmax(outputs, dim=1)
+                    # outputs = model(images)
+                    outputs = model(images).squeeze(1)
+                    batch_weights = weights_tensor[labels.long()]
+                    unweighted_loss_val = criterion(outputs, labels.float())
+                    # loss_val = criterion(outputs, labels)
+                    loss_val = (unweighted_loss_val * batch_weights).mean()
+                    # probs_val = F.softmax(outputs, dim=1)
 
                     val_loss += loss_val.item() * images.size(0)
 
-                    confidences, predicted = torch.max(probs_val, 1)
+                    # confidences, predicted = torch.max(probs_val, 1)
+                    predicted = torch.round(outputs.data).clamp(0, 4).long()
 
                     total_val += labels.size(0)
                     correct_val += (predicted == labels).sum().item()
@@ -240,6 +254,9 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
 
                     # unnormalize and store images for confusion matrix visualization
                     images_np = unnormalize_tensor(images)
+
+                    distances = torch.abs(outputs.data - predicted.float()) 
+                    confidences = torch.clamp(1.0 - distances, min=0.0, max=1.0)
 
                     for i in range(len(labels)):
                         epoch_val_images.append({
@@ -307,6 +324,7 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
         logger.info(f"Fold {val_fold} complete! Best validation score: {best_val_score:.4f} at epoch: {best_epoch}")
     
     logger.info(f"Training complete! timestamp: {timestamp}")
+    logger.info("=" * 20)
 
     return timestamp, MODE
 
