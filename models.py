@@ -100,7 +100,11 @@ class Classification_DenseNet(nn.Module):
                         param.requires_grad = False
                         break
 
-        self.model.classifier = nn.Linear(self.model.classifier.in_features, num_classes)
+        in_features = self.model.classifier.in_features
+        self.model.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(in_features, num_classes)
+        )
 
     def forward(self, x):
         return self.model(x)
