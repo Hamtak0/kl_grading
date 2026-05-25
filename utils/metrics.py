@@ -3,11 +3,16 @@ from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
-def create_confusion_matrix_figure(y_true: list[int] | np.ndarray, y_pred: list[int] | np.ndarray, num_classes: int, title: str) -> Figure:
+def create_confusion_matrix_figure(y_true: list[int] | np.ndarray, y_pred: list[int] | np.ndarray, target: str, title: str) -> Figure:
     """
     Generates a matplotlib figure containing a styled Confusion Matrix.
     """
-    classes = [f"Grade {i}" for i in range(num_classes)]
+    if target == "KL":
+        num_classes = 5
+        classes = [f"Grade {i}" for i in range(num_classes)]
+    elif target == "OA":
+        num_classes = 2
+        classes = ["Healthy (0)", "OA (1)"]
     cm = confusion_matrix(y_true, y_pred, labels=range(num_classes))
     
     fig, ax = plt.subplots(figsize=(6, 6))

@@ -16,7 +16,7 @@ def get_transform(rotation: float = 10, jitter: float = 0.3, sharpness: float = 
     ]
     if is_train:
         transforms.extend([
-            T.RandomAffine(degrees=rotation, translate=(0.05, 0.05), scale=(0.8, 1.2)),
+            T.RandomAffine(degrees=rotation, translate=(0.05, 0.05), scale=(0.9, 1.1)),
             T.RandomAdjustSharpness(sharpness_factor=sharpness),
             T.ColorJitter(brightness=jitter, contrast=jitter)
         ])

@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from torchvision.transforms import v2 as T
 import numpy as np
 
-def extract_uniform_crop(image_tensor: torch.Tensor, box: tuple[float, float, float, float] | list[float] | np.ndarray , target_size: int = 512) -> torch.Tensor:
+def extract_uniform_crop(image_tensor: torch.Tensor, box: tuple[float, float, float, float] | list[float] | np.ndarray , target_size: int = 640) -> torch.Tensor:
     """
     Takes a full image tensor and a bounding box. 
     Returns a perfectly undistorted target_size x target_size tensor.
