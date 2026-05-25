@@ -25,7 +25,7 @@ def train_rcnn(timestamp=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    env_cfg = load_toml_config("configs/config.toml")
+    env_cfg = load_toml_config(Path("configs/config.toml"))
 
     """
     Hyperparameters:
@@ -48,27 +48,18 @@ def train_rcnn(timestamp=None):
         return
 
     fold_handler = Fold_Handler(full_dataset)
+    all_folds = fold_handler.get_all_folds()
 
-    test_idx, cv_idx = [], []
-    for i in range(len(full_dataset)):
-        patient_id = full_dataset.patient_ids[i]
-        assigned_fold = fold_handler.get_fold(patient_id)
-        if assigned_fold == fold_handler.get_test_fold():
-            test_idx.append(i)
-        else:
-            cv_idx.append(i)
-
-    logger.info(f"Locked Test Set (Fold 0): {len(test_idx)} images")
-    logger.info(f"Cross-Validation Pool: {len(cv_idx)} images")
-
-    cv_folds = fold_handler.get_cv_folds()
-    for val_fold in cv_folds:
-        logger.info(f"{'-' * 15}Starting Fold {val_fold}/{len(cv_folds)}{'-' * 15}")
-        run_name = f"runs/rcnn_{timestamp}_fold{val_fold}"
+    for test_fold in all_folds:
+        val_fold = (test_fold + 1) % len(all_folds)
+        train_folds = [f for f in all_folds if f not in (test_fold, val_fold)]
+    
+        logger.info(f"{'-' * 15} Starting Model {test_fold} /{len(all_folds)} | Train: {train_folds} | Val: {val_fold} {'-' * 15}")
+        run_name = Path(f"runs/rcnn_{timestamp}_fold{test_fold}")
         writer = SummaryWriter(log_dir=run_name)
 
         train_idx, val_idx = [], []
-        for i in cv_idx:
+        for i in range(len(full_dataset)):
             patient_id = full_dataset.patient_ids[i]
             if fold_handler.get_fold(patient_id) == val_fold:
                 val_idx.append(i)
@@ -114,7 +105,7 @@ def train_rcnn(timestamp=None):
             train_loss = 0.0
 
             # Training
-            loop = tqdm(data_loader_train, desc=f"Fold {val_fold} - Epoch [{epoch + 1}/{NUM_EPOCHS}]")
+            loop = tqdm(data_loader_train, desc=f"Model {test_fold} - Epoch [{epoch + 1}/{NUM_EPOCHS}]")
             for images, targets in loop:
                 # Move images and targets to GPU
                 images = list(image.to(device) for image in images)
@@ -156,17 +147,17 @@ def train_rcnn(timestamp=None):
                 best_epoch = epoch + 1
 
                 os.makedirs("./weights", exist_ok=True)
-                save_path = Path("./weights/") / f"knee_rcnn_{timestamp}_fold{val_fold}.pth"
+                save_path = Path("./weights/") / f"knee_rcnn_{timestamp}_fold{test_fold}.pth"
                 torch.save(model.state_dict(), save_path)
-                logger.info(f"New best model found for Fold {val_fold} at epoch {epoch + 1} with validation loss: {best_val_loss:.4f}")
+                logger.info(f"New best model found for model {test_fold} at epoch {epoch + 1} with validation loss: {best_val_loss:.4f}")
 
         writer.close()
-        logger.info(f"Fold {val_fold} complete! Best Val Loss: {best_val_loss:.4f} at epoch {best_epoch}")
+        logger.info(f"Model {test_fold} complete! Best Val Loss: {best_val_loss:.4f} at epoch {best_epoch}")
 
     logger.info(f"Training RCNN completed for all folds! Timestamp: {timestamp}")
     return timestamp
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
     parser = argparse.ArgumentParser(description="Train RCNN model for knee grading")
     parser.add_argument("--timestamp", type=str, help="Timestamp for the whole process")
     args = parser.parse_args()

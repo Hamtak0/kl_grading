@@ -5,6 +5,8 @@ import torch
 import torchvision
 from torch.utils.data import DataLoader, Subset
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
 from tqdm import tqdm
 
 from dataset_handler import KLGradingDataset, Fold_Handler
@@ -24,7 +26,7 @@ def test_rcnn(timestamp_override: str = None):
     logger.info(f"Testing object detection (Timestamp: {timestamp})")
     logger.info(f"Running on device: {device}")
 
-    env_cfg = load_toml_config("configs/config.toml")
+    env_cfg = load_toml_config(Path("configs/config.toml"))
     try:
         full_dataset = KLGradingDataset(
             root=env_cfg["dataset"]["root_dir"],
@@ -36,95 +38,77 @@ def test_rcnn(timestamp_override: str = None):
         return
 
     fold_handler = Fold_Handler(full_dataset)
-    test_idx = []
+    all_folds = fold_handler.get_all_folds()
 
-    for i in range(len(full_dataset)):
-        patient_id = full_dataset.patient_ids[i]
-        if fold_handler.get_fold(patient_id) == fold_handler.get_test_fold():
-            test_idx.append(i)
-
-    test_subset = Subset(full_dataset, test_idx)
-    data_loader_test = DataLoader(
-        test_subset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=3,
-        collate_fn=collate_fn
-    )
-
-    models = []
-    num_classes = 3
-    for fold in fold_handler.get_cv_folds():
-        model = RCNN(num_classes=num_classes).to(device)
-        weight_path = Path(f"./weights/knee_rcnn_{timestamp}_fold{fold}.pth")
-        try:
-            model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
-            model.eval()
-            models.append(model)
-        except Exception as e:
-            logger.error(f"Could not load R-CNN weights at {weight_path}. Error: {e}")
-            return
-
-    if not models:
-        logger.error("No models loaded. Aborting...")
-        return
-
-    output_dir = Path(f"./cropped_test/{timestamp}_fold0")
+    output_dir = Path(f"./cropped_test/image_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info(f"Running inference on {len(test_subset)} unseen X-rays")
 
     # Non-Maximum Suppression (NMS)
     IOU_THRESHOLD = 0.5
     SCORE_THRESHOLD = 0.7
+    num_classes = 3
 
-    with torch.no_grad():
-        for batch_idx, (images, targets) in enumerate(tqdm(data_loader_test)):
-            images = list(image.to(device) for image in images)
+    for test_fold in all_folds:
+        logger.info(f"Testing using Model {test_fold}.")
 
-            # since batch_size is 1
-            image_tensor = images[0]
+        test_idx = [i for i, pid in enumerate(full_dataset.patient_ids) if fold_handler.get_fold(pid) == test_fold]
+        test_subset = Subset(full_dataset, test_idx)
+        data_loader_test = DataLoader(
+            test_subset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=3,
+            collate_fn=collate_fn
+        )
 
-            all_boxes = []
-            all_scores = []
-            all_labels = []
+        model = RCNN(num_classes=num_classes).to(device)
+        weight_path = Path(f"./weights/knee_rcnn_{timestamp}_fold{test_fold}.pth")
 
-            for model in models:
+        try:
+            model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
+            model.eval()
+        except Exception as e:
+            logger.error(f"Could not load R-CNN weights at {weight_path}. Error: {e}")
+            continue
+
+        logger.info(f"Running inference on {len(test_subset)} unseen X-rays")
+
+        with torch.no_grad():
+            for batch_idx, (images, targets) in enumerate(tqdm(data_loader_test, desc=f"Testing Fold {test_fold}")):
+                # since batch_size is 1
+                image_tensor = images[0].to(device)
+
                 prediction = model([image_tensor])[0]
-                all_boxes.append(prediction['boxes'])
-                all_scores.append(prediction['scores'])
-                all_labels.append(prediction['labels'])
+                cat_boxes = prediction['boxes']
+                cat_scores = prediction['scores']
+                cat_labels = prediction['labels']
 
-            cat_boxes = torch.cat(all_boxes, dim=0)
-            cat_scores = torch.cat(all_scores, dim=0)
-            cat_labels = torch.cat(all_labels, dim=0)
+                # filtering the low confident 
+                mask = cat_scores > SCORE_THRESHOLD
+                cat_boxes = cat_boxes[mask]
+                cat_scores = cat_scores[mask]
+                cat_labels = cat_labels[mask]
 
-            # filtering the low confident 
-            mask = cat_scores > SCORE_THRESHOLD
-            cat_boxes = cat_boxes[mask]
-            cat_scores = cat_scores[mask]
-            cat_labels = cat_labels[mask]
+                # apply nms to fuse overlapping boxes
+                keep_idx = torchvision.ops.nms(cat_boxes, cat_scores, IOU_THRESHOLD)
+                final_boxes = cat_boxes[keep_idx].cpu().numpy()
+                final_scores = cat_scores[keep_idx].cpu().numpy()
+                final_labels = cat_labels[keep_idx].cpu().numpy()
 
-            # apply nms to fuse overlapping boxes
-            keep_idx = torchvision.ops.nms(cat_boxes, cat_scores, IOU_THRESHOLD)
-            final_boxes = cat_boxes[keep_idx].cpu().numpy()
-            final_scores = cat_scores[keep_idx].cpu().numpy()
-            final_labels = cat_labels[keep_idx].cpu().numpy()
+                fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+                ax.imshow(image_tensor.cpu().numpy().transpose(1, 2, 0), cmap="gray")
 
-            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-            ax.imshow(image_tensor[0].cpu().numpy(), cmap="gray")
-            
-            patient_id = full_dataset.bounding[test_idx[batch_idx]].split(".")[0]
-            ax.set_title(f"Ensemble R-CNN Prediction: {patient_id}")
-            ax.axis('off')
+                patient_id = full_dataset.bounding[test_idx[batch_idx]].split(".")[0]
+                ax.set_title(f"Model {test_fold} R-CNN Prediction: {patient_id}")
+                ax.axis('off')
 
-            for box, score, label in zip(final_boxes, final_scores, final_labels):
-                color = "red" if label == 1 else "blue" # 1 = Left, 2 = Right
-                side = "L" if label == 1 else "R"
-                draw_box(ax, color=color, title=f"{side} ({score:.2f})", box=box)
+                for box, score, label in zip(final_boxes, final_scores, final_labels):
+                    color = "red" if label == 1 else "blue" # 1 = Left, 2 = Right
+                    side = "L" if label == 1 else "R"
+                    draw_box(ax, color=color, title=f"{side} ({score:.2f})", box=box)
 
-            fig.savefig(output_dir / f"{patient_id}_rcnn_ensemble.png", bbox_inches='tight', dpi=150)
-            plt.close(fig)
+                fig.savefig(output_dir / f"{patient_id}_rcnn_fold{test_fold}.png", bbox_inches='tight', dpi=150)
+                plt.close(fig)
 
     logger.info(f"Testing complete! Visualizations saved to {output_dir}")
 
