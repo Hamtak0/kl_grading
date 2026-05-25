@@ -1,54 +1,49 @@
 import argparse
 import os
 import sys
-import subprocess
 import tomllib
 
-def run_stage(cmd, stage_name):
-    print(f"Running: {stage_name}")
-    result = subprocess.run(cmd, stdout=sys.stdout, stderr=sys.stderr)
-    if result.returncode != 0:
-        print(f"\n:x: Pipeline aborted during: {stage_name}")
-        sys.exit(1)
+from optuna_classification import run_optuna_search
+from train_classification import train_classification
+from test_classification import test_classification
 
-def main():
-    parser = argparse.ArgumentParser(description="Master Execution Orchestrator")
+def pipeline_classification():
+    parser = argparse.ArgumentParser(description="Full classification pipeline model training and testing")
     parser.add_argument("--config", type=str, default="configs/config.toml", help="Path to baseline TOML configuration")
     parser.add_argument("--mode", type=str, choices=["LEFT", "RIGHT", "BOTH"], help="Override the lateral standardization mode")
     parser.add_argument("--trials", type=int, help="Override the baseline Optuna search budget")
+    parser.add_argument("--target", type=str, default="KL", choices=["KL", "OA"], help="Target of the model (KL grading or Osteoarthritis separation)")
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
-        print(f":x: Configuration file not found at: {args.config}")
+        print(f"Configuration file not found at: {args.config}")
         sys.exit(1)
 
     with open(args.config, "rb") as f:
         cfg = tomllib.load(f)
 
-    lateral_mode = args.mode if args.mode else cfg["experiment"]["lateral_mode"]
+    lateral_mode = args.mode.upper() if args.mode else cfg["experiment"]["lateral_mode"]
     search_trials = args.trials if args.trials else cfg["optuna"]["n_trials"]
     base_epochs = cfg["training_defaults"]["num_epochs"]
+    target = args.target.upper() if args.target else cfg["experiment"]["target"]
 
     print(f"Target Configuration: {args.config}")
-    print(f"Active Execution Mode: {lateral_mode} | Search Trials: {search_trials}")
+    print(f"Active Execution Mode: {lateral_mode} | Search Trials: {search_trials} | Target: {target}")
 
-    optuna_cmd = [sys.executable, "optuna_classification.py", "--mode", lateral_mode, "--trials", str(search_trials), "--epochs", str(base_epochs)]
-    run_stage(optuna_cmd, f"Optuna Discovery ({lateral_mode})")
+    print(f"-- Phase 1: Optuna Hyperparameters searching")
+    best_params_path = run_optuna_search(mode=lateral_mode, trials=search_trials, epochs=base_epochs, target=target)
 
-    from train_classification import train_classification
-    timestamp, trained_mode = train_classification(
-        config_path=f"./configs/best_params_{lateral_mode}.json",
-        mode_override=lateral_mode
-    )
+    print(f"-- Phase 2: 5-fold training ({target})")
+    timestamp, trained_mode = train_classification(config_path=best_params_path, mode_override=lateral_mode, target=target)
 
     if not timestamp:
-        print("\n:x: Training failed to yield a valid model timestamp. Aborting.")
+        print("Training failed to yield a valid model timestamp. Aborting.")
         sys.exit(1)
 
-    from test_classification import test_classification
-    test_classification(timestamp_override=timestamp, mode_override=trained_mode)
+    print(f"-- Phase 3: Evaluation with test fold for each model ({target})")
+    test_classification(timestamp_override=timestamp, mode_override=trained_mode, target=target)
 
-    print(f"\n:trophy: Master Pipeline successfully completed for mode: {lateral_mode}!")
+    print(f"Pipeline successfully completed for {target} (Mode: {lateral_mode})!")
 
 if __name__ == "__main__":
-    main()
+    pipeline_classification()

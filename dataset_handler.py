@@ -320,6 +320,10 @@ class Fold_Handler:
             raise ValueError(f"Patient {patient_id} not found in the fold mapping.")
         return self.patient_to_fold[patient_id]
 
+    def get_all_folds(self):
+        return sorted(list(set(self.patient_to_fold.values())))
+
+    #! These were the old approches
     def get_test_fold(self):
         return 0
 

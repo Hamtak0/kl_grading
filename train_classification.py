@@ -14,10 +14,10 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
-import torch.nn.functional as F
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import balanced_accuracy_score
 
@@ -29,7 +29,7 @@ from utils.config import load_toml_config
 from dataset_handler import CachedKneeDataset, TransformWrapper, Fold_Handler
 from models import Classification_ResNet, Classification_DenseNet
 
-def train_classification(config_path=None, mode_override=None, timestamp_override=None) -> Tuple[Optional[str], Optional[str]]:
+def train_classification(config_path: str = None, mode_override: str = None, timestamp_override: str = None, target: str = "OA") -> Tuple[Optional[str], Optional[str]]:
     set_seed(42) # Just same as kl grading seed cross-validation
 
     logger = setup_logger(name="KneeClassifier", log_file="classifier_training.log")
@@ -58,11 +58,14 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
         WEIGHT_DECAY = hyper_cfg.get("weight_decay", WEIGHT_DECAY)
         ETA_MIN = hyper_cfg.get("eta_min", ETA_MIN)
         # LABEL_SMOOTHING = hyper_cfg.get("label_smoothing", LABEL_SMOOTHING)
-    
     if mode_override:
         MODE = mode_override.upper()
 
-    logger.info(f"Training parameters -> Mode: {MODE}, Batch: {BATCH_SIZE}, Epochs: {NUM_EPOCHS}, LR: {LR:.6f}")
+    # To handle nvidia dedicated GPU memory
+    physical_batch_size = 2
+    accumuation_steps = max(1, BATCH_SIZE // physical_batch_size)
+
+    logger.info(f"Training parameters {target} -> Mode: {MODE}, Batch: {BATCH_SIZE}, Epochs: {NUM_EPOCHS}, LR: {LR:.6f}")
 
     try:
         cv_classifier_dataset = CachedKneeDataset(
@@ -76,98 +79,76 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
         return None, None
 
     fold_handler = Fold_Handler(cv_classifier_dataset)
+    all_folds = fold_handler.get_all_folds()
 
-    test_idx = []
-    cv_idx = []
+    fold_scores = []
+    gpu_train_transform = get_transform(rotation=10, jitter=0.3, sharpness=2, is_train=True).to(device)
+    gpu_val_transform = get_transform(rotation=0, jitter=0, sharpness=0, is_train=False).to(device)
 
-    for i, sample in enumerate(cv_classifier_dataset.samples):
-        base_id = sample["patient_id"].split("_")[0]
-        assigned_fold = fold_handler.get_fold(base_id)
+    # if target == "KL": num_classes = 1
+    # elif target == "OA": num_classes = 2
 
-        if assigned_fold == fold_handler.get_test_fold():
-            test_idx.append(i) # Fold 0
-        else:
-            cv_idx.append(i) # Folds 1-4
+    for test_fold in all_folds:
+        val_fold = (test_fold + 1) % len(all_folds)
+        train_folds = [f for f in all_folds if f not in (test_fold, val_fold)]
 
-    logger.info(f"Locked Test Set (Fold 0): {len(test_idx)} knees")
-    logger.info(f"Available for Cross-Validation: {len(cv_idx)} knees")
+        logger.info(f"{'-'*10} Model {test_fold} | Train: {train_folds}, Val: {val_fold} {'-'*10}")
 
-    cv_folds = fold_handler.get_cv_folds()
-
-    #* Notes: We have 5 folds in total
-    #* Fold 0 is reserved as a locked test set that we never touch during training or validation.
-    #* Perform 4-fold cross-validation and use 1 fold for validation and the remaining 3 folds for training in each iteration.
-    #* Therefore, we use 60% of the data for training, 20% for validation, and 20% for testing.
-    for val_fold in cv_folds:
-        logger.info(f"{'-'*10}Starting Fold {val_fold}/{len(cv_folds)}{'-'*10}")
-
-        run_name = f"runs/classification_{timestamp}_fold{val_fold}_{MODE}"
+        run_name = Path(f"runs/classification_{timestamp}_{target}_fold{test_fold}_{MODE}")
         writer = SummaryWriter(log_dir=run_name)
 
         train_idx, val_idx = [], []
-
-        for i in cv_idx:
-            sample = cv_classifier_dataset.samples[i]
+        for i, sample in enumerate(cv_classifier_dataset.samples):
             base_id = sample["patient_id"].split("_")[0] # ID001, ID002, etc.
             assigned_fold = fold_handler.get_fold(base_id)
-
-            # Use another one fold for validation, the rest for training
             if assigned_fold == val_fold:
                 val_idx.append(i)
-            else:
+            elif assigned_fold in train_folds:
                 train_idx.append(i)
     
         train_subset = Subset(cv_classifier_dataset, train_idx)
         val_subset = Subset(cv_classifier_dataset, val_idx)
 
-        train_dataset = TransformWrapper(
-            train_subset,
-            # get_classification_transform(rotation=5, jitter=0.05, is_train=True),
-            mode=MODE
-        )
-        val_dataset = TransformWrapper(
-            val_subset,
-            # get_classification_transform(rotation=0, jitter=0, is_train=False),
-            mode=MODE
-        )
+        train_dataset = TransformWrapper(train_subset, mode=MODE)
+        val_dataset = TransformWrapper(val_subset, mode=MODE)
 
         data_loader_train = DataLoader(
             train_dataset,
-            batch_size=BATCH_SIZE,
+            batch_size=physical_batch_size,
             shuffle=True,
             num_workers=3,
             pin_memory=True,
-            prefetch_factor=2,
         )
         data_loader_val = DataLoader(
             val_dataset,
-            batch_size=BATCH_SIZE,
+            batch_size=physical_batch_size,
             shuffle=False,
             num_workers=3,
             pin_memory=True,
         )
 
-        train_labels = [cv_classifier_dataset.samples[i]['kl_grade'] for i in train_idx]
-        raw_weights = compute_class_weight(class_weight='balanced', classes=np.arange(5), y=train_labels)
-        weights_tensor = torch.tensor(raw_weights, dtype=torch.float32).to(device)
+        if target == "KL": # 5 grades
+            # model = Classification_CNN(num_classes=5, in_channels=1).to(device)
+            # model = Classification_ResNet(num_classes=5).to(device)
+            model = Classification_DenseNet(num_classes=1).to(device)
+            train_labels = [cv_classifier_dataset.samples[i]['kl_grade'] for i in train_idx]
+            raw_weights = compute_class_weight(class_weight='balanced', classes=np.arange(5), y=train_labels)
+            weights_tensor = torch.tensor(raw_weights, dtype=torch.float32).to(device)
+            criterion = nn.MSELoss(reduction='none')
+        elif target == "OA": # 2 grades
+            model = Classification_DenseNet(num_classes=2).to(device)
+            train_labels = [cv_classifier_dataset.samples[i]['oa_grade'] for i in train_idx]
+            raw_weights = compute_class_weight(class_weight='balanced', classes=np.array([0, 1]), y=train_labels)
+            weights_tensor = torch.tensor(raw_weights, dtype=torch.float32).to(device)
+            criterion = nn.CrossEntropyLoss(weight=weights_tensor)
 
-        # model = Classification_CNN(num_classes=5, in_channels=1).to(device)
-        # model = Classification_ResNet(num_classes=5).to(device)
-        model = Classification_DenseNet(num_classes=1).to(device)
-        # criterion = nn.CrossEntropyLoss(
-        #     weight=weights_tensor,
-        #     label_smoothing=LABEL_SMOOTHING
-        # )
-        criterion = nn.MSELoss(reduction='none')
         optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
         scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=ETA_MIN)
 
         best_val_score = 0.0
         best_epoch = 0
-        gpu_train_transform = get_transform(rotation=10, jitter=0.3, sharpness=2, is_train=True).to(device)
-        gpu_val_transform = get_transform(rotation=0, jitter=0, sharpness=0, is_train=False).to(device)
 
-        # scaler = torch.amp.GradScaler('cuda')
+        scaler = torch.amp.GradScaler('cuda')
 
         for epoch in range(NUM_EPOCHS):
             model.train()
@@ -175,45 +156,48 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
             correct_train = 0
             total_train = 0
 
-            loop = tqdm(data_loader_train, desc=f"Fold {val_fold} - Epoch [{epoch+1}/{NUM_EPOCHS}]")
+            optimizer.zero_grad()
 
-            for images, labels, oa, _ in loop:
+            loop = tqdm(data_loader_train, desc=f"Model {test_fold} - Epoch [{epoch+1}/{NUM_EPOCHS}]")
+
+            for step, (images, kl, oa, _) in enumerate(loop):
                 # print("Labels in current batch:", labels)
-                images = images.to(device)
-                labels = labels.to(device)
-
-                images = gpu_train_transform(images)
-
+                if target == "KL":
+                    labels = kl.to(device)
+                elif target == "OA":
+                    labels = oa.to(device)
+                images = gpu_train_transform(images.to(device))
+    
                 optimizer.zero_grad()
 
-                outputs = model(images).squeeze(1)
-                batch_weights = weights_tensor[labels.long()]
-                unweighted_loss = criterion(outputs, labels.float())
-                loss = (unweighted_loss * batch_weights).mean()
-                # with torch.amp.autocast('cuda'):
-                    # outputs = model(images)
-                    # loss = criterion(outputs, labels)
-                    # probs = F.softmax(outputs, dim=1)
+                outputs = model(images)
+                with torch.amp.autocast('cuda'):
+                    if target == "KL":
+                        outputs = outputs.squeeze(1)
+                        unweighted_loss = criterion(outputs, labels.float())
+                        weighted_sum = (unweighted_loss * weights_tensor[labels.long()]).sum()
+                        raw_loss = weighted_sum / weights_tensor[labels.long()].sum()
+                        predicted = torch.round(outputs.data).clamp(0, 4).long()
+                    elif target == "OA":
+                        raw_loss = criterion(outputs, labels)
+                        _, predicted = torch.max(outputs.data, 1)
+                    loss = raw_loss / accumuation_steps
 
-                # scaler.scale(loss).backward()
-                loss.backward()
+                scaler.scale(loss).backward()
+                # loss.backward()
 
-                # scaler.step(optimizer)
-                # scaler.update()
-                optimizer.step()
+                if (step + 1) % accumuation_steps == 0 or (step + 1) == len(data_loader_train):
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    # optimizer.step()
 
-                train_loss += loss.item() * images.size(0)
-
-                # Calculate Training Accuracy
-                # _, predicted = torch.max(outputs.data, 1)
-                predicted = torch.round(outputs.data).clamp(0, 4).long()
-
+                train_loss += raw_loss.item() * images.size(0)
                 total_train += labels.size(0)
                 correct_train += (predicted == labels).sum().item()
+                loop.set_postfix(loss=raw_loss.item())
 
-                loop.set_postfix(loss=loss.item())
-
-            avg_train_loss = train_loss / len(train_subset)
+            avg_train_loss = train_loss / total_train 
             train_acc = correct_train / total_train
 
             model.eval()
@@ -227,25 +211,26 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
             epoch_val_images = []
 
             with torch.no_grad():
-                for images, labels, oa, patient_ids in data_loader_val:
-                    images = images.to(device)
-                    labels = labels.to(device)
-
-                    images = gpu_val_transform(images)
-
-                    # outputs = model(images)
-                    outputs = model(images).squeeze(1)
-                    batch_weights = weights_tensor[labels.long()]
-                    unweighted_loss_val = criterion(outputs, labels.float())
-                    # loss_val = criterion(outputs, labels)
-                    loss_val = (unweighted_loss_val * batch_weights).mean()
-                    # probs_val = F.softmax(outputs, dim=1)
+                for images, kl, oa, patient_ids in data_loader_val:
+                    if target == "KL": labels = kl.to(device)
+                    elif target == "OA": labels = oa.to(device)
+                    images = gpu_val_transform(images.to(device))
+    
+                    outputs = model(images)
+                    if target == "KL":
+                        outputs = outputs.squeeze(1)
+                        unweighted_loss = criterion(outputs, labels.float())
+                        weighted_sum = (unweighted_loss * weights_tensor[labels.long()]).sum()
+                        loss_val = weighted_sum / weights_tensor[labels.long()].sum()
+                        predicted = torch.round(outputs.data).clamp(0, 4).long()
+                        distances = torch.abs(outputs.data - predicted.float()) 
+                        confidences = torch.clamp(1.0 - distances, min=0.0, max=1.0)
+                    elif target == "OA":
+                        loss_val = criterion(outputs, labels)
+                        probs = F.softmax(outputs, dim=1)
+                        confidences, predicted = torch.max(probs, 1)
 
                     val_loss += loss_val.item() * images.size(0)
-
-                    # confidences, predicted = torch.max(probs_val, 1)
-                    predicted = torch.round(outputs.data).clamp(0, 4).long()
-
                     total_val += labels.size(0)
                     correct_val += (predicted == labels).sum().item()
 
@@ -254,9 +239,6 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
 
                     # unnormalize and store images for confusion matrix visualization
                     images_np = unnormalize_tensor(images)
-
-                    distances = torch.abs(outputs.data - predicted.float()) 
-                    confidences = torch.clamp(1.0 - distances, min=0.0, max=1.0)
 
                     for i in range(len(labels)):
                         epoch_val_images.append({
@@ -267,7 +249,7 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
                             "patient_id": patient_ids[i] 
                         })
 
-            avg_val_loss = val_loss / len(val_subset)
+            avg_val_loss = val_loss / total_val
             val_acc = correct_val / total_val
             val_balanced_acc = balanced_accuracy_score(all_val_labels, all_val_preds)
 
@@ -276,25 +258,24 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
             logger.info(f"Fold {val_fold} | Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} (Acc: {train_acc:.2%}) | Val Loss: {avg_val_loss:.4f} (Acc: {val_acc:.2%}) | Bal Acc: {val_balanced_acc:.2%}")
 
             cm_title = f'Mode {MODE} Fold {val_fold} Epoch {epoch+1}\nVal Acc: {val_acc:.2%} | Bal Acc: {val_balanced_acc:.2%}'
-            fig = create_confusion_matrix_figure(all_val_labels, all_val_preds, num_classes=5, title=cm_title)
+            fig = create_confusion_matrix_figure(all_val_labels, all_val_preds, target=target, title=cm_title)
 
             # TensorBoard Logging
             writer.add_scalars("Loss", {"Train": avg_train_loss, "Validation": avg_val_loss}, epoch+1)
             writer.add_scalars("Accuracy", {"Train": train_acc, "Validation": val_acc, "Balanced": val_balanced_acc}, epoch+1)
-            writer.add_figure("Confusion Matrix", fig, epoch+1)
 
             # Early Stopping
             if val_balanced_acc > best_val_score:
                 best_val_score = val_balanced_acc
-                best_epoch = epoch+1
+                best_epoch = epoch + 1
 
                 os.makedirs("./weights", exist_ok=True)
-                torch.save(model.state_dict(), f"./weights/knee_class_{timestamp}_fold{val_fold}_{MODE}.pth")
+                torch.save(model.state_dict(), Path(f"./weights/knee_class_{timestamp}_{target}_fold{test_fold}_{MODE}.pth"))
 
                 os.makedirs("./confusion_matrices", exist_ok=True)
-                fig.savefig(f"./confusion_matrices/cm_{timestamp}_fold{val_fold}_{MODE}.png", dpi=150)
+                fig.savefig(f"./confusion_matrices/cm_{timestamp}_{target}_fold{test_fold}_{MODE}.png", dpi=150)
 
-                img_save_dir = Path(f"./images_val/{timestamp}_fold{val_fold}_{MODE}")
+                img_save_dir = Path(f"./images_val/{timestamp}_{target}_fold{test_fold}_{MODE}")
                 if img_save_dir.exists():
                     shutil.rmtree(img_save_dir)
                 img_save_dir.mkdir(parents=True, exist_ok=True)
@@ -321,9 +302,10 @@ def train_classification(config_path=None, mode_override=None, timestamp_overrid
             plt.close(fig)
 
         writer.close()
-        logger.info(f"Fold {val_fold} complete! Best validation score: {best_val_score:.4f} at epoch: {best_epoch}")
+        fold_scores.append(best_val_score)
+        logger.info(f"Model {test_fold} complete! Best validation score: {best_val_score:.4f} at epoch: {best_epoch}")
     
-    logger.info(f"Training complete! timestamp: {timestamp}")
+    logger.info(f"5-Model validation average ({target}): {np.mean(fold_scores):.4%}, timestamp: {timestamp}")
     logger.info("=" * 20)
 
     return timestamp, MODE
@@ -333,6 +315,6 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, help="Path to JSON hyperparameters config file")
     parser.add_argument("--mode", type=str, choices=["LEFT", "RIGHT", "BOTH"], help="Override training mode")
     parser.add_argument("--timestamp", type=str, help="Timestamp of the whole process")
-    args = parser.parse_args
-
-    train_classification(config_path=args.config, mode_override=args.mode, timestamp_override=args.timestamp)
+    parser.add_argument("--target", type=str, default="KL", choices=["KL", "OA"], help="Target of the model (KL grading or Osteoarthritis separation)")
+    args = parser.parse_args()
+    train_classification(config_path=args.config, mode_override=args.mode, timestamp_override=args.timestamp, target=args.target)
