@@ -16,13 +16,13 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import balanced_accuracy_score
 
 from dataset_handler import CachedKneeDataset, Fold_Handler, TransformWrapper
-from models import Classification_ResNet, Classification_DenseNet
+from models import Classification_DenseNet
 from utils.logger import setup_logger
 from utils.seed_setup import set_seed
 from utils.transform import get_transform
 from utils.config import load_toml_config
 
-def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target: str = "OA"):
+def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target: str = "OA", loss_fn: str = "CE"):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Hyperparameter Search Space
@@ -47,7 +47,7 @@ def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target
     val_fold = cv_folds[0]
     train_folds = cv_folds[1:]
 
-    gpu_train_transform = get_transform(rotation=10, jitter=0.3, sharpness=2, is_train=True).to(device)
+    gpu_train_transform = get_transform(rotation=0, jitter=0.3, sharpness=2, is_train=True).to(device)
     gpu_val_transform = get_transform(rotation=0, jitter=0, sharpness=0, is_train=False).to(device)
 
     train_idx, val_idx = [], []
@@ -81,13 +81,16 @@ def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target
     )
     
     if target == "KL":
-        # model = Classification_ResNet(num_classes=5).to(device)
-        model = Classification_DenseNet(num_classes=1).to(device)
+        if loss_fn == "MSE": num_classes = 1
+        elif loss_fn == "CE": num_classes = 5
+        model = Classification_DenseNet(num_classes=num_classes).to(device)
         train_labels = [cv_classifier_dataset.samples[i]["kl_grade"] for i in train_idx]
         class_weights = compute_class_weight(class_weight='balanced', classes=np.arange(5), y=train_labels)
         weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
-        # criterion = nn.CrossEntropyLoss(weight=weights_tensor, label_smoothing=label_smoothing)
-        criterion = nn.MSELoss(reduction='none')
+
+        if loss_fn == "MSE": criterion = nn.MSELoss(reduction='none')
+        elif loss_fn == "CE": criterion = nn.CrossEntropyLoss(weight=weights_tensor)
+
     elif target == "OA":
         model = Classification_DenseNet(num_classes=2).to(device)
         train_labels = [cv_classifier_dataset.samples[i]["oa_grade"] for i in train_idx]
@@ -112,17 +115,16 @@ def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target
                 labels = oa.to(device)
             images = gpu_train_transform(images.to(device))
 
-            # optimizer.zero_grad()
-
-            outputs = model(images)
             with torch.amp.autocast('cuda'):
-                if target == "KL":
+                outputs = model(images)
+                if target == "KL" and loss_fn == "MSE":
                     outputs = outputs.squeeze(1)
                     unweighted_loss = criterion(outputs, labels.float())
                     weighted_sum = (unweighted_loss * weights_tensor[labels.long()]).sum()
                     raw_loss = weighted_sum / weights_tensor[labels.long()].sum()
-                elif target == "OA":
+                elif target == "OA" or loss_fn == "CE":
                     raw_loss = criterion(outputs, labels)
+
                 loss = raw_loss / accumulation_steps
             
             scaler.scale(loss).backward()
@@ -138,19 +140,20 @@ def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target
         all_val_labels, all_val_preds = [], []
         with torch.no_grad():
             for images, kl, oa, _ in data_loader_val:
-                if target == "KL":
-                    labels = kl.to(device)
-                elif target == "OA":
-                    labels = oa.to(device)
+                if target == "KL": labels = kl.to(device)
+                elif target == "OA": labels = oa.to(device)
                 images = gpu_val_transform(images.to(device))
     
-                outputs = model(images)
-                if target == "KL":
+                with torch.amp.autocast('cuda'):
+                    outputs = model(images)
+
+                outputs = outputs.float()
+                if target == "KL" and loss_fn == "MSE":
                     outputs = outputs.squeeze(1)
                     predicted = torch.round(outputs.data).clamp(0, 4).long()
-                elif target == "OA":
+                elif target == "OA" or loss_fn == "CE":
                     probs = F.softmax(outputs, dim=1)
-                    confidences, predicted = torch.max(probs, 1)
+                    _, predicted = torch.max(probs, 1)
     
                 all_val_labels.extend(labels.cpu().numpy())
                 all_val_preds.extend(predicted.cpu().numpy())
@@ -166,7 +169,7 @@ def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target
     
     return best_val_score
 
-def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, target: str = "OA"):
+def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, target: str = "OA", loss_fn: str = "CE", strategy: str = "kfold_nested"):
     set_seed(42)
 
     logger = setup_logger(name="OptunaSearch", log_file="optuna.log")
@@ -182,7 +185,7 @@ def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, ta
         direction="maximize", # highest balanced accuracy
         pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=3)
     )
-    bound_objective = lambda trial: objective(trial=trial, mode=mode, base_epochs=epochs, target=target)
+    bound_objective = lambda trial: objective(trial=trial, mode=mode, base_epochs=epochs, target=target, loss_fn=loss_fn)
     study.optimize(bound_objective, n_trials=trials, show_progress_bar=True)
 
     logger.info("-" * 15)
@@ -205,7 +208,7 @@ def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, ta
         # "label_smoothing": study.best_trial.params["label_smoothing"],
     }
 
-    output_path = Path(f"./configs/best_params_{target}_{mode}.json")
+    output_path = Path(f"./configs/best_params_{target}_{mode}_{strategy}.json")
     with open(output_path, "w") as f:
         json.dump(best_config_data, f, indent=4)
     logger.info("=" * 15)
@@ -213,9 +216,11 @@ def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, ta
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optuna Hyperparameters Optimization")
-    parser.add_argument("--mode", type=str, default="BOTH", choices=["LEFT", "RIGHT", "BOTH"], help="Lateral anatomical standardization mode")
-    parser.add_argument("--trials", type=int, default=25, help="Number of search trials")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs per trials")
-    parser.add_argument("--target", type=str, default="KL", choices=["KL", "OA"], help="Target of the model (KL grading or Osteoarthritis separation)")
+    parser.add_argument("-m", "--mode", type=str, choices=["LEFT", "RIGHT", "BOTH"], help="Lateral anatomical standardization mode")
+    parser.add_argument("-tr", "--trials", type=int, default=25, help="Number of search trials")
+    parser.add_argument("-e", "--epochs", type=int, default=50, help="Number of epochs per trials")
+    parser.add_argument("-ta", "--target", type=str, choices=["KL", "OA"], help="Target of the model (KL grading or Osteoarthritis separation)")
+    parser.add_argument("-l", "--loss", type=str, choices=["CE", "MSE"], help="Loss function to be trained with")
+    parser.add_argument("-s", "--strategy", type=str, choices=["single_holdout", "kfold_blind", "kfold_nested"], help="Cross-validation architecture to named")
     args = parser.parse_args()
-    run_optuna_search(mode=args.mode, trials=args.trials, epochs=args.epochs, target=args.target)
+    run_optuna_search(mode=args.mode, trials=args.trials, epochs=args.epochs, target=args.target, loss_fn=args.loss, strategy=args.strategy)

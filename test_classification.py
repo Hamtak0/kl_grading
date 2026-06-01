@@ -20,9 +20,9 @@ from utils.metrics import create_confusion_matrix_figure
 from utils.transform import get_transform, unnormalize_tensor
 from utils.config import load_toml_config
 from dataset_handler import CachedKneeDataset, TransformWrapper, Fold_Handler
-from models import Classification_ResNet, Classification_DenseNet
+from models import Classification_DenseNet
 
-def test_classification(timestamp_override: str = None, mode_override: str = "BOTH", target: str = "OA"):
+def test_classification(timestamp_override: str = None, mode_override: str = "BOTH", target: str = "OA", loss_fn: str = "CE", strategy: str = "kfold_nested"):
     set_seed(42)
 
     logger = setup_logger(name="KneeTest", log_file="classifier_testing.log")
@@ -31,7 +31,7 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
 
     timestamp = timestamp_override if timestamp_override else "20260511_154935"
     MODE = mode_override.upper()
-    logger.info(f"Test for {target}, timestamp: {timestamp}, mode: {MODE}")
+    logger.info(f"Test for {target} ({loss_fn}), strategy: {strategy}, timestamp: {timestamp}, mode: {MODE}")
 
     env_cfg = load_toml_config("configs/config.toml")
     try:
@@ -55,50 +55,70 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
     test_images_data = []
     gpu_test_transform = get_transform(rotation=0, jitter=0, sharpness=0, is_train=False).to(device)
 
-    if target == "KL": num_classes = 1
+    if target == "KL":
+        if loss_fn == "MSE": num_classes = 1
+        elif loss_fn == "CE": num_classes = 5
     elif target == "OA": num_classes = 2
     target_names = [f"Grade {i}" for i in range(5)] if target == "KL" else ["Healthy (0)", "OA (1)"]
 
-    for test_fold in all_folds:
-        logger.info(f"Testing with fold {test_fold}")
+    if strategy == "single_holdout":
+        test_fold = fold_handler.get_test_fold()
+        logger.info(f"Executing ensemble with test fold {test_fold}.")
+
+        models = []
+        cv_folds = fold_handler.get_cv_folds()
+        for fold in cv_folds:
+            model = Classification_DenseNet(num_classes=num_classes).to(device)
+            weight_path = Path(f"./weights/knee_class_{timestamp}_{target}_fold{fold}_{MODE}.pth")
+            if weight_path.exists():
+                model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
+                model.eval()
+                models.append(model)
+            else:
+                logger.warning(f"Model weights not found for fold {fold} at {weight_path}. Skipping this fold.")
+
+        if not models:
+            logger.error("No valid models found for testing. Aborting.")
+            return
 
         test_idx = [i for i, sample in enumerate(cv_classifier_dataset.samples) if fold_handler.get_fold(sample["patient_id"].split("_")[0]) == test_fold]
         test_subset = Subset(cv_classifier_dataset, test_idx)
         test_dataset = TransformWrapper(test_subset, mode=MODE)
-        data_loader_test = DataLoader(
-            test_dataset,
-            batch_size=2,
-            shuffle=False,
-            num_workers=3,
-            pin_memory=True
-        )
+        data_loader_test = DataLoader(test_dataset, batch_size=2, shuffle=False, num_workers=3, pin_memory=True)
 
-        model = Classification_DenseNet(num_classes=num_classes).to(device)
-        weight_path = Path(f"./weights/knee_class_{timestamp}_{target}_fold{test_fold}_{MODE}.pth")
-        model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
-
-        model.eval()
-    
         with torch.no_grad():
-            for images, kl, oa, pids in tqdm(data_loader_test, desc=f"Testing with fold-{test_fold}"):
+            for images, kl, oa, pids in tqdm(data_loader_test, desc=f"Ensemble testing with fold-{test_fold}"):
                 if target == "KL": labels = kl.to(device)
                 elif target == "OA": labels = oa.to(device)
                 images = gpu_test_transform(images.to(device))
-                outputs = model(images)
-                
-                if target == "KL":
-                    predicted = torch.round(outputs.squeeze(1).data).clamp(0, 4).long()
-                    distances = torch.abs(outputs.squeeze(1) - predicted.float())
+
+                ensemble_outputs = []
+                for model in models:
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(images)
+                    outputs = outputs.float()
+
+                    if target == "KL" and loss_fn == "MSE":
+                        ensemble_outputs.append(outputs.squeeze(1))
+                    elif target == "OA" or loss_fn == "CE":
+                        probabilities = F.softmax(outputs, dim=1)
+                        ensemble_outputs.append(probabilities)
+
+                avg_outputs = torch.mean(torch.stack(ensemble_outputs), dim=0)
+
+                if target == "KL" and loss_fn == "MSE":
+                    predicted = torch.round(avg_outputs).clamp(0, 4).long()
+                    distances = torch.abs(avg_outputs - predicted.float()) 
                     confidences = torch.clamp(1.0 - distances, min=0.0, max=1.0)
-                elif target == "OA":
-                    probabilities = F.softmax(outputs, dim=1)
+                elif target == "OA" or loss_fn == "CE":
+                    probabilities = F.softmax(avg_outputs, dim=1)
                     confidences, predicted = torch.max(probabilities, 1)
 
                 all_labels.extend(labels.cpu().numpy())
                 all_preds.extend(predicted.cpu().numpy())
                 all_confs.extend(confidences.cpu().numpy())
                 all_pids.extend(pids)
-                    
+
                 images_np = unnormalize_tensor(images.cpu())
                 for i in range(len(labels)):
                     test_images_data.append({
@@ -109,10 +129,75 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
                         "patient_id": pids[i]
                     })
 
+    # Evaluate K-fold blind and nested strategies
+    else:
+        for test_fold in all_folds:
+            logger.info(f"Testing with fold {test_fold}")
+
+            test_idx = [i for i, sample in enumerate(cv_classifier_dataset.samples) if fold_handler.get_fold(sample["patient_id"].split("_")[0]) == test_fold]
+            test_subset = Subset(cv_classifier_dataset, test_idx)
+            test_dataset = TransformWrapper(test_subset, mode=MODE)
+            data_loader_test = DataLoader(
+                test_dataset,
+                batch_size=2,
+                shuffle=False,
+                num_workers=3,
+                pin_memory=True
+            )
+
+            model = Classification_DenseNet(num_classes=num_classes).to(device)
+            weight_path = Path(f"./weights/knee_class_{timestamp}_{target}_fold{test_fold}_{MODE}.pth")
+
+            if not weight_path.exists():
+                logger.warning(f"File {weight_path} missing. Skipping fold {test_fold}.")
+                continue
+
+            model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
+            model.eval()
+    
+            with torch.no_grad():
+                for images, kl, oa, pids in tqdm(data_loader_test, desc=f"Testing with fold-{test_fold}"):
+                    if target == "KL": labels = kl.to(device)
+                    elif target == "OA": labels = oa.to(device)
+                    images = gpu_test_transform(images.to(device))
+
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(images)
+
+                    outputs = outputs.float()
+
+                    if target == "KL" and loss_fn == "MSE":
+                        outputs_mse = outputs.squeeze(1)
+                        predicted = torch.round(outputs_mse).clamp(0, 4).long()
+                        distances = torch.abs(outputs_mse - predicted.float())
+                        confidences = torch.clamp(1.0 - distances, min=0.0, max=1.0)
+                    elif target == "OA" or loss_fn == "CE":
+                        probabilities = F.softmax(outputs, dim=1)
+                        confidences, predicted = torch.max(probabilities, 1)
+
+                    all_labels.extend(labels.cpu().numpy())
+                    all_preds.extend(predicted.cpu().numpy())
+                    all_confs.extend(confidences.cpu().numpy())
+                    all_pids.extend(pids)
+
+                    images_np = unnormalize_tensor(images.cpu())
+                    for i in range(len(labels)):
+                        test_images_data.append({
+                            "image": images_np[i],
+                            "true_label": labels[i].item(),
+                            "pred_label": predicted[i].item(),
+                            "confidence": confidences[i].item(),
+                            "patient_id": pids[i]
+                        })
+
     all_labels = np.array(all_labels)
     all_preds = np.array(all_preds)
     all_confs = np.array(all_confs)
     all_pids = np.array(all_pids)
+
+    if len(all_labels) == 0:
+        logger.error("No test predictions were collected. Aborting evaluation.")
+        return
 
     test_acc = accuracy_score(all_labels, all_preds)
     test_bal_acc = balanced_accuracy_score(all_labels, all_preds)
@@ -120,13 +205,13 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
     logger.info(f"-- Final test accuracy ({target}): {test_acc:.2%}")
     logger.info(f"-- Final balanced accuracy ({target}): {test_bal_acc:.2%}")
 
-    logger.info(f"Classification {target} report from the test fold {test_fold}:")
+    logger.info(f"Classification {target} report {strategy}:")
     report = classification_report(all_labels, all_preds, target_names=target_names, zero_division=0)
     logger.info("\n" + report)
 
     # creates results directory for grouping test together
     os.makedirs("./results", exist_ok=True)
-    results_dir = Path(f"./results/{timestamp}_{target}_{MODE}")
+    results_dir = Path(f"./results/{timestamp}_{target}_{MODE}_{strategy}")
     results_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Consolidating all performance into: {results_dir}")
 
@@ -182,8 +267,8 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
     fig_overall.savefig(results_dir / f"cm_OVERALL", dpi=300)
     plt.close(fig_overall)
 
-    #! Saving each images of the overall confusion matrix 
-    img_save_dir = Path(f"./images_test/{timestamp}_{target}_{MODE}")
+    # Saving each images of the overall confusion matrix 
+    img_save_dir = Path(f"./images_test/{timestamp}_{target}_{MODE}_{strategy}")
     if img_save_dir.exists():
         shutil.rmtree(img_save_dir)
     img_save_dir.mkdir(parents=True, exist_ok=True)
@@ -212,8 +297,10 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Testing Classification")
-    parser.add_argument("--timestamp", type=str, help="timestamp for the ensemble weights")
-    parser.add_argument("--mode", type=str, default="BOTH", choices=["LEFT", "RIGHT", "BOTH"], help="Lateral standardization mode")
-    parser.add_argument("--target", type=str, default="KL", choices=["KL", "OA"], help="Target of the model (KL grading or Osteoarthritis separation)")
+    parser.add_argument("-ts", "--timestamp", type=str, help="timestamp for the ensemble weights")
+    parser.add_argument("-m", "--mode", type=str, choices=["LEFT", "RIGHT", "BOTH"], help="Lateral standardization mode")
+    parser.add_argument("-t", "--target", type=str, choices=["KL", "OA"], help="Target of the model (KL grading or Osteoarthritis separation)")
+    parser.add_argument("-l", "--loss", type=str, choices=["CE", "MSE"], help="Loss function to be trained with")
+    parser.add_argument("-s", "--strategy", type=str, choices=["single_holdout", "kfold_blind", "kfold_nested"], help="Cross-validation architecture to use")
     args = parser.parse_args()
-    test_classification(timestamp_override=args.timestamp, mode_override=args.mode, target=args.target)
+    test_classification(timestamp_override=args.timestamp, mode_override=args.mode, target=args.target, loss_fn=args.loss, strategy=args.strategy)
