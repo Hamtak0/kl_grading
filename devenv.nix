@@ -11,6 +11,7 @@
   # env.GREET = "devenv";
 
   # https://devenv.sh/packages/
+  # -- This is for pure nix way
   # packages =
   #   let
   #     inherit (pkgs.python3Packages)
@@ -29,6 +30,7 @@
   # languages.rust.enable = true;
   languages.typst.enable = true;
 
+  # -- This is for standard python way (let uv and pyproject.toml decide)
   languages.python = {
     enable = true;
     directory = ".";
