@@ -6,7 +6,7 @@ from typing import Any
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-def get_transform(rotation: float = 10, jitter: float = 0.3, sharpness: float = 3.0, is_train: bool = False) -> T.Compose:
+def get_transform(rotation: float = 0, jitter: float = 0.3, sharpness: float = 3.0, is_train: bool = False) -> T.Compose:
     transforms = [
         # https://pytorch.org/hub/pytorch_vision_resnet/
         T.ToImage(),

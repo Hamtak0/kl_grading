@@ -39,6 +39,13 @@ def draw_box(
         label=title
     )
     ax.add_patch(rect)
+
+    if title:
+        ax.text(
+            xmin, ymin - 15, title, color=color, fontsize=6, fontweight='bold',
+            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=2)
+        )
+
     return rect
 
 def main(specific: str | None = None) -> None:
