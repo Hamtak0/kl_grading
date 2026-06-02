@@ -2,13 +2,11 @@ import logging
 import sys
 from pathlib import Path
 
-def setup_logger(name: str ="KneeProject", log_file: str ="app.log") -> logging.Logger:
+def setup_logger(name: str ="KneeProject", log_file: str = "app.log") -> logging.Logger:
     """
     Sets up a logger that outputs to both the console and a file.
     """
-    logs_dir = Path("./logs")
-    logs_dir.mkdir(exist_ok=True)
-    log_file_path = logs_dir / log_file
+    log_file_path = Path(log_file)
 
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
