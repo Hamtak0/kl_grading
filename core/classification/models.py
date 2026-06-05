@@ -1,20 +1,5 @@
-import torch
 import torch.nn as nn
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models import resnet18, ResNet18_Weights, densenet121, DenseNet121_Weights
-
-class RCNN(nn.Module):
-    """
-    Transfer learning object detection model using Faster R-CNN with a ResNet-50 backbone.
-    """
-    def __init__(self, num_classes: int=3):
-        super(RCNN, self).__init__()
-        self.model = fasterrcnn_resnet50_fpn(weight="FasterRCNN_ResNet50_FPN_Weights.DEFAULT")
-        self.model.roi_heads.box_predictor = FastRCNNPredictor(self.model.roi_heads.box_predictor.cls_score.in_features, num_classes)
-
-    def forward(self, images, targets=None):
-        return self.model(images, targets)
 
 class Classification_ResNet(nn.Module):
     """
@@ -41,6 +26,32 @@ class Classification_ResNet(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+class Classification_DenseNet(nn.Module):
+    """
+    Transfer learning image classification model using DenseNet-121.
+    """
+    def __init__(self, num_classes: int = 5, freeze_backbone: bool = False):
+        super(Classification_DenseNet, self).__init__()
+        self.model = densenet121(weights=DenseNet121_Weights.DEFAULT) #, memory_efficient=True)
+
+        selected_layer = ["conv0", "norm0"] + [f"denseblock{i}" for i in range(1, 4)] + [f"transition{i}" for i in range(1, 4)]
+        if freeze_backbone:
+            for name, param in self.model.named_parameters():
+                for layer in selected_layer:
+                    if layer in name:
+                        param.requires_grad = False
+                        break
+
+        in_features = self.model.classifier.in_features
+        self.model.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(in_features, num_classes)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+''' Notes: the dataset is very small, training the whole network from scratch is not a good idea.
 class Classification_CNN(nn.Module):
     """
     A simple convolutional neural network (CNN) for image classification.
@@ -86,25 +97,4 @@ class Classification_CNN(nn.Module):
         x = self.features(x)
         x = self.classifier(x)
         return x
-
-class Classification_DenseNet(nn.Module):
-    def __init__(self, num_classes: int = 5, freeze_backbone: bool = False):
-        super(Classification_DenseNet, self).__init__()
-        self.model = densenet121(weights=DenseNet121_Weights.DEFAULT) #, memory_efficient=True)
-
-        selected_layer = ["conv0", "norm0"] + [f"denseblock{i}" for i in range(1, 4)] + [f"transition{i}" for i in range(1, 4)]
-        if freeze_backbone:
-            for name, param in self.model.named_parameters():
-                for layer in selected_layer:
-                    if layer in name:
-                        param.requires_grad = False
-                        break
-
-        in_features = self.model.classifier.in_features
-        self.model.classifier = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(in_features, num_classes)
-        )
-
-    def forward(self, x):
-        return self.model(x)
+'''

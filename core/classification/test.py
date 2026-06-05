@@ -1,5 +1,4 @@
 import argparse
-import os
 import shutil
 from pathlib import Path
 
@@ -19,21 +18,30 @@ from utils.logger import setup_logger
 from utils.metrics import create_confusion_matrix_figure
 from utils.transform import get_transform, unnormalize_tensor
 from utils.config import load_toml_config
-from dataset_handler import CachedKneeDataset, TransformWrapper, Fold_Handler
-from models import Classification_DenseNet
+from core.data.dataset_handler import CachedKneeDataset, TransformWrapper, Fold_Handler
+from core.classification.models import Classification_DenseNet
 
-def test_classification(timestamp_override: str = None, mode_override: str = "BOTH", target: str = "OA", loss_fn: str = "CE", strategy: str = "kfold_nested"):
+def test_classification(timestamp_override: str = None, mode: str = "BOTH", target: str = "OA", loss_fn: str = "CE", strategy: str = "kfold_nested"):
     set_seed(42)
 
-    logger = setup_logger(name="KneeTest", log_file="classifier_testing.log")
+    timestamp = timestamp_override if timestamp_override else "20260511_154935"
+    MODE = mode.upper()
+
+    results_dir = Path(f"./results/classification/{timestamp}_{strategy}_{target}_{MODE}_{loss_fn}")
+    (results_dir / "metrics").mkdir(parents=True, exist_ok=True)
+
+    img_save_dir = results_dir / "images_test"
+    if img_save_dir.exists():
+        shutil.rmtree(img_save_dir)
+    img_save_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = setup_logger(name="Classification Testing", log_file=str(results_dir / "densenet_testing.log"))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Starting Testing on device: {device}")
 
-    timestamp = timestamp_override if timestamp_override else "20260511_154935"
-    MODE = mode_override.upper()
-    logger.info(f"Test for {target} ({loss_fn}), strategy: {strategy}, timestamp: {timestamp}, mode: {MODE}")
+    logger.info(f"Test with strategy: {strategy} | target: {target} | mode: {MODE} | timestamp: {timestamp}")
 
-    env_cfg = load_toml_config("configs/config.toml")
+    env_cfg = load_toml_config(Path("configs/config.toml"))
     try:
         cv_classifier_dataset = CachedKneeDataset(
             cache_dir=env_cfg["dataset"]["cache_dir"],
@@ -69,7 +77,7 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
         cv_folds = fold_handler.get_cv_folds()
         for fold in cv_folds:
             model = Classification_DenseNet(num_classes=num_classes).to(device)
-            weight_path = Path(f"./weights/knee_class_{timestamp}_{target}_fold{fold}_{MODE}.pth")
+            weight_path = results_dir / "weights" / f"fold{fold}.pth"
             if weight_path.exists():
                 model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
                 model.eval()
@@ -146,7 +154,7 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
             )
 
             model = Classification_DenseNet(num_classes=num_classes).to(device)
-            weight_path = Path(f"./weights/knee_class_{timestamp}_{target}_fold{test_fold}_{MODE}.pth")
+            weight_path = results_dir / "weights" / f"fold{test_fold}.pth"
 
             if not weight_path.exists():
                 logger.warning(f"File {weight_path} missing. Skipping fold {test_fold}.")
@@ -210,9 +218,6 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
     logger.info("\n" + report)
 
     # creates results directory for grouping test together
-    os.makedirs("./results", exist_ok=True)
-    results_dir = Path(f"./results/{timestamp}_{target}_{MODE}_{strategy}")
-    results_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Consolidating all performance into: {results_dir}")
 
     # Bilateral subgroup export
@@ -227,9 +232,9 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
         l_bal_acc = balanced_accuracy_score(l_labels, l_preds)
         logger.info(f"Left knees (count: {np.sum(left_mask)}) - Accuracy: {l_acc:.2%}, Balanced Accuracy: {l_bal_acc:.2%}")
 
-        cm_title_l = f"Left knees ({MODE})\nAccuracy: {l_acc:.2f}, Balance Accurary: {l_bal_acc:.2f}"
+        cm_title_l = f"Left knees ({MODE})\nAccuracy: {l_acc:.2%}, Balance Accurary: {l_bal_acc:.2%}"
         fig_l = create_confusion_matrix_figure(l_labels, l_preds, target=target, title=cm_title_l)
-        fig_l.savefig(results_dir / f"cm_LEFT.png", dpi=300)
+        fig_l.savefig(results_dir / "metrics" / f"cm_LEFT.png", dpi=300)
         plt.close(fig_l)
     else:
         logger.warning("No left knees found in the test set")
@@ -241,9 +246,9 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
         r_bal_acc = balanced_accuracy_score(r_labels, r_preds)
         logger.info(f"Right knees (count: {np.sum(right_mask)}) - Accuracy: {r_acc:.2%}, Balanced Accuracy: {r_bal_acc:.2%}")
 
-        cm_title_r = f"Left knees ({MODE})\nAccuracy: {r_acc:.2f}, Balance Accurary: {r_bal_acc:.2f}"
+        cm_title_r = f"Right knees ({MODE})\nAccuracy: {r_acc:.2%}, Balance Accurary: {r_bal_acc:.2%}"
         fig_r = create_confusion_matrix_figure(r_labels, r_preds, target=target, title=cm_title_r)
-        fig_r.savefig(results_dir / f"cm_RIGHT.png", dpi=300)
+        fig_r.savefig(results_dir / "metrics" / f"cm_RIGHT.png", dpi=300)
         plt.close(fig_r)
     else:
         logger.warning("No right knees found in the test set")
@@ -258,17 +263,17 @@ def test_classification(timestamp_override: str = None, mode_override: str = "BO
     results_df['Correct'] = results_df[f'True {target}'] == results_df[f'Predicted {target}']
     
     # CSV export
-    csv_path = results_dir / f"predictions_{target}.csv"
+    csv_path = results_dir / "metrics" / f"predictions_{target}.csv"
     results_df.to_csv(csv_path, index=False)
     logger.info(f"Detailed results saved to {csv_path}")
 
     cm_title_overall = f"Confusion Matrix {target} (Acc: {test_acc:.2%}, Bal Acc: {test_bal_acc:.2%})"
     fig_overall = create_confusion_matrix_figure(all_labels, all_preds, target=target, title=cm_title_overall)
-    fig_overall.savefig(results_dir / f"cm_OVERALL", dpi=300)
+    fig_overall.savefig(results_dir / "metrics" / f"cm_OVERALL.png", dpi=300)
     plt.close(fig_overall)
 
     # Saving each images of the overall confusion matrix 
-    img_save_dir = Path(f"./images_test/{timestamp}_{target}_{MODE}_{strategy}")
+    img_save_dir = results_dir / "images_test"
     if img_save_dir.exists():
         shutil.rmtree(img_save_dir)
     img_save_dir.mkdir(parents=True, exist_ok=True)

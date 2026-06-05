@@ -16,5 +16,6 @@ devenv.local.yaml
 __pycache__/
 .python-version
 
-# no dataset included
+# Keep the private data
 dataset/
+results/

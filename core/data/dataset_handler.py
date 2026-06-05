@@ -66,7 +66,7 @@ class KLGradingDataset(Dataset):
             valid_ids = paired_ids
 
         self.patient_ids = sorted(list(valid_ids))
-        self.dicom = [dicom_map[pid] for pid in self.patient_ids]
+        self.dicom = [dicom_map[pid] for pid in self.patient_ids] # ID001, ID002, ...
         self.bounding = [bounding_map[pid] for pid in self.patient_ids]
 
     def _get_pixel_box(self, ds, crop_data):

@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -26,29 +25,44 @@ from utils.metrics import create_confusion_matrix_figure
 from utils.transform import get_transform, unnormalize_tensor
 from utils.seed_setup import set_seed
 from utils.config import load_toml_config
-from dataset_handler import CachedKneeDataset, TransformWrapper, Fold_Handler
-from models import Classification_DenseNet
+from core.data.dataset_handler import CachedKneeDataset, TransformWrapper, Fold_Handler
+from core.classification.models import Classification_DenseNet
 
-def train_classification(config_path: str | None = None, mode_override: str | None = None, timestamp_override: str | None = None, target: str = "OA", loss_fn: str | None = "CE", strategy: str = "kfold_nested") -> tuple[Optional[str], Optional[str]]:
+def train_classification(
+        timestamp_override: str | None = None,
+        config_path: str | Path | None = None,
+        mode: str | None = None,
+        target: str = "OA",
+        loss_fn: str | None = "CE",
+        strategy: str = "kfold_nested"
+    ) -> tuple[Optional[str], Optional[str]]:
     set_seed(42) # Just same as kl grading seed cross-validation
 
-    logger = setup_logger(name="KneeClassifier", log_file="classifier_training.log")
     timestamp = timestamp_override if timestamp_override else datetime.now().strftime('%Y%m%d_%H%M%S')
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
 
     # default parameters from config.toml, can be overridden by JSON config or command-line args
-    env_cfg = load_toml_config("configs/config.toml")
-    MODE = env_cfg["experiment"]["lateral_mode"] # "LEFT", "RIGHT", or "BOTH"
-    BATCH_SIZE = env_cfg["training_defaults"]["batch_size"]
-    NUM_EPOCHS = env_cfg["training_defaults"]["num_epochs"]
+    env_cfg = load_toml_config(Path("configs/config.toml"))
+    MODE = mode.upper() if mode else env_cfg["experiment"]["lateral_mode"] # "LEFT", "RIGHT", or "BOTH"
+    BATCH_SIZE = env_cfg["classification_defaults"]["batch_size"]
+    NUM_EPOCHS = env_cfg["classification_defaults"]["num_epochs"]
     LR = 1.4768e-4
     WEIGHT_DECAY = 9.2914e-5
     ETA_MIN = 1.64e-6
     # LABEL_SMOOTHING = 0.25422
 
-    if config_path and os.path.exists(config_path):
+    results_dir = Path(f"./results/classification/{timestamp}_{strategy}_{target}_{MODE}_{loss_fn}")
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    (results_dir / "weights").mkdir(exist_ok=True)
+    (results_dir / "runs").mkdir(exist_ok=True)
+    (results_dir / "metrics" / "confusion_matrices").mkdir(parents=True, exist_ok=True)
+
+    logger = setup_logger(name="Classification Training", log_file=str(results_dir / "densenet_training.log"))
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device}")
+
+    if config_path and Path(config_path).exists():
         logger.info(f"Loading parameters from {config_path}")
         with open(config_path, "r") as f:
             hyper_cfg = json.load(f)
@@ -59,12 +73,12 @@ def train_classification(config_path: str | None = None, mode_override: str | No
         WEIGHT_DECAY = hyper_cfg.get("weight_decay", WEIGHT_DECAY)
         ETA_MIN = hyper_cfg.get("eta_min", ETA_MIN)
         # LABEL_SMOOTHING = hyper_cfg.get("label_smoothing", LABEL_SMOOTHING)
-    if mode_override:
-        MODE = mode_override.upper()
+    else:
+        logger.warning(f"No valid config file found at {config_path}. Falling back to baseline TOML defaults.")
 
     # To handle nvidia dedicated GPU memory
     physical_batch_size = 2
-    accumuation_steps = max(1, BATCH_SIZE // physical_batch_size)
+    accumulation_steps = max(1, BATCH_SIZE // physical_batch_size)
 
     logger.info(f"Training parameters {target} -> Mode: {MODE}, Batch: {BATCH_SIZE}, Epochs: {NUM_EPOCHS}, LR: {LR:.6f}")
 
@@ -119,7 +133,7 @@ def train_classification(config_path: str | None = None, mode_override: str | No
 
         logger.info(f"Model {model_id} | Train: {train_folds} | Val: {val_fold} | Test: {test_fold}")
 
-        run_name = Path(f"runs/classification_{timestamp}_{target}_fold{model_id}_{MODE}")
+        run_name = results_dir / "runs" / f"fold{model_id}"
         writer = SummaryWriter(log_dir=run_name)
 
         train_idx = []
@@ -189,12 +203,12 @@ def train_classification(config_path: str | None = None, mode_override: str | No
                         raw_loss = criterion(outputs, labels)
                         _, predicted = torch.max(outputs.data, 1)
 
-                    loss = raw_loss / accumuation_steps
+                    loss = raw_loss / accumulation_steps
 
                 scaler.scale(loss).backward() # add current gradient to the buffer
                 # loss.backward()
 
-                if (step + 1) % accumuation_steps == 0 or (step + 1) == len(data_loader_train):
+                if (step + 1) % accumulation_steps == 0 or (step + 1) == len(data_loader_train):
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
@@ -278,13 +292,11 @@ def train_classification(config_path: str | None = None, mode_override: str | No
                     best_val_score = val_balanced_acc
                     best_epoch = epoch + 1
 
-                    os.makedirs("./weights", exist_ok=True)
-                    torch.save(model.state_dict(), Path(f"./weights/knee_class_{timestamp}_{target}_fold{model_id}_{MODE}.pth"))
+                    torch.save(model.state_dict(), results_dir / "weights" / f"fold{model_id}.pth")
 
-                    os.makedirs("./confusion_matrices", exist_ok=True)
-                    fig.savefig(f"./confusion_matrices/cm_{timestamp}_{target}_fold{model_id}_{MODE}.png", dpi=150)
+                    fig.savefig(results_dir / "metrics" / "validation_confusion_matrices" / f"cm_fold{model_id}.png", dpi=150)
 
-                    img_save_dir = Path(f"./images_val/{timestamp}_{target}_fold{model_id}_{MODE}")
+                    img_save_dir = results_dir / "images_val" / f"fold{model_id}"
                     if img_save_dir.exists():
                         shutil.rmtree(img_save_dir)
                     img_save_dir.mkdir(parents=True, exist_ok=True)
@@ -317,8 +329,7 @@ def train_classification(config_path: str | None = None, mode_override: str | No
                 writer.add_scalars("Accuracy", {"Train": train_acc}, epoch+1)
 
                 if epoch == NUM_EPOCHS - 1: # Save the final model
-                    os.makedirs("./weights", exist_ok=True)
-                    torch.save(model.state_dict(), Path(f"./weights/knee_class_{timestamp}_{target}_fold{model_id}_{MODE}.pth"))
+                    torch.save(model.state_dict(), results_dir / "weights" / f"fold{model_id}.pth")
                     logger.info(f"Blind training complete. Model {model_id} at epoch {epoch+1}")
 
         writer.close()

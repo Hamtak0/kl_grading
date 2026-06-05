@@ -1,8 +1,8 @@
 import argparse
 import json
 import logging
-import os
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import optuna
@@ -15,14 +15,14 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import balanced_accuracy_score
 
-from dataset_handler import CachedKneeDataset, Fold_Handler, TransformWrapper
-from models import Classification_DenseNet
+from core.data.dataset_handler import CachedKneeDataset, Fold_Handler, TransformWrapper
+from core.classification.models import Classification_DenseNet
 from utils.logger import setup_logger
 from utils.seed_setup import set_seed
 from utils.transform import get_transform
 from utils.config import load_toml_config
 
-def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target: str = "OA", loss_fn: str = "CE"):
+def objective(trial: optuna.Trial, mode: str = "BOTH", base_epochs: int = 50, target: str = "OA", loss_fn: str = "CE"):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Hyperparameter Search Space
@@ -35,7 +35,7 @@ def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target
     physical_batch_size = 2
     accumulation_steps = max(1, batch_size // physical_batch_size)
     
-    env_cfg = load_toml_config("configs/config.toml")
+    env_cfg = load_toml_config(Path("configs/config.toml"))
     cv_classifier_dataset = CachedKneeDataset(
         cache_dir=env_cfg["dataset"]["cache_dir"],
         root=env_cfg["dataset"]["root_dir"],
@@ -44,7 +44,8 @@ def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target
     fold_handler = Fold_Handler(cv_classifier_dataset)
 
     cv_folds = fold_handler.get_cv_folds()
-    val_fold = cv_folds[0]
+    # Use heuristic to assign the first fold of cross-validation that not include test fold.
+    val_fold = cv_folds[0] 
     train_folds = cv_folds[1:]
 
     gpu_train_transform = get_transform(rotation=0, jitter=0.3, sharpness=2, is_train=True).to(device)
@@ -169,11 +170,23 @@ def objective(trial: int = 15, mode: str = "BOTH", base_epochs: int = 50, target
     
     return best_val_score
 
-def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, target: str = "OA", loss_fn: str = "CE", strategy: str = "kfold_nested"):
+def run_optuna_search(
+        mode: str = "BOTH",
+        trials: int = 15,
+        epochs: int = 50,
+        target: str = "OA",
+        loss_fn: str = "CE",
+        strategy: str = "kfold_nested"
+    ):
     set_seed(42)
 
-    logger = setup_logger(name="OptunaSearch", log_file="optuna.log")
-    logger.info(f"Starting Hyperparameter Optimization {target} (Mode: {mode}) for {trials} trials")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    results_dir = Path(f"./results/classification/{timestamp}_{strategy}_{target}_{mode}_{loss_fn}")
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = setup_logger(name="Optuna Search", log_file=str(results_dir / "optuna.log"))
+    logger.info(f"Starting Hyperparameter Optimization {strategy} (Target: {target}, Mode: {mode}, Loss function: {loss_fn}) for {trials} trials")
 
     optuna_logger = logging.getLogger("optuna")
     optuna_logger.handlers.clear()
@@ -181,7 +194,7 @@ def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, ta
         optuna_logger.addHandler(handler)
 
     study = optuna.create_study(
-        study_name=f"model_hyperparams_optimization_{target}_{mode}",
+        study_name=f"model_hyperparams_optimization_{strategy}_{target}_{mode}_{loss_fn}",
         direction="maximize", # highest balanced accuracy
         pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=3)
     )
@@ -189,7 +202,7 @@ def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, ta
     study.optimize(bound_objective, n_trials=trials, show_progress_bar=True)
 
     logger.info("-" * 15)
-    logger.info(f"OPTIMIZATION COMPLETE {target} ({mode})")
+    logger.info(f"OPTIMIZATION COMPLETE {strategy} (Target: {target}, Mode: {mode}, Loss function: {loss_fn})")
     logger.info(f"Best Trial Number: {study.best_trial.number}")
     logger.info(f"Highest Balanced Validation Accuracy: {study.best_value:.2%}")
 
@@ -197,7 +210,6 @@ def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, ta
     for key, value in study.best_trial.params.items():
         logger.info(f"    {key}: {value}")
 
-    os.makedirs("./configs", exist_ok=True)
     best_config_data = {
         "target": target,
         "lateral_mode": mode,
@@ -208,11 +220,13 @@ def run_optuna_search(mode: str = "BOTH", trials: int = 15, epochs: int = 50, ta
         # "label_smoothing": study.best_trial.params["label_smoothing"],
     }
 
-    output_path = Path(f"./configs/best_params_{target}_{mode}_{strategy}.json")
-    with open(output_path, "w") as f:
+    json_path = results_dir / "best_trial_config.json"
+    with open(json_path, "w") as f:
         json.dump(best_config_data, f, indent=4)
+    logger.info(f"Optuna search complete! Results saved to: {json_path}")
     logger.info("=" * 15)
-    return output_path
+
+    return timestamp, json_path
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optuna Hyperparameters Optimization")
@@ -221,6 +235,6 @@ if __name__ == "__main__":
     parser.add_argument("-e", "--epochs", type=int, default=50, help="Number of epochs per trials")
     parser.add_argument("-ta", "--target", type=str, choices=["KL", "OA"], help="Target of the model (KL grading or Osteoarthritis separation)")
     parser.add_argument("-l", "--loss", type=str, choices=["CE", "MSE"], help="Loss function to be trained with")
-    parser.add_argument("-s", "--strategy", type=str, choices=["single_holdout", "kfold_blind", "kfold_nested"], help="Cross-validation architecture to named")
+    parser.add_argument("-s", "--strategy", type=str, choices=["single_holdout", "kfold_blind", "kfold_nested"], help="Cross-validation architecture to use")
     args = parser.parse_args()
     run_optuna_search(mode=args.mode, trials=args.trials, epochs=args.epochs, target=args.target, loss_fn=args.loss, strategy=args.strategy)
