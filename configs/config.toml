@@ -1,0 +1,33 @@
+'''
+Example of training and testing config
+'''
+
+[experiment]
+global_seed = 42
+lateral_mode = "LEFT"
+target = "OA"
+loss_function = "CE"
+
+strategy = "single_holdout"
+# strategy = "kfold_nested"
+# strategy = "kfold_blind"
+
+[optuna]
+n_trials = 20
+pruner_startup_trials = 5
+pruner_warmup_steps = 5
+
+[detection_defaults]
+batch_size = 2
+num_epochs = 30
+score_threshold = 0.9
+iou_threshold = 0.5
+
+[classification_defaults]
+batch_size = 16
+num_epochs = 80
+
+[dataset]
+root_dir = "./dataset"
+cache_dir = "./dataset/cached_crops"
+excel_file = "./dataset/KLGrade_label_with_5fold.xlsx"

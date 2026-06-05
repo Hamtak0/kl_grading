@@ -1,0 +1,20 @@
+'''
+Example of the inference config
+'''
+
+[inference]
+strategy = "single_holdout"
+# strategy = "kfold_blind"
+# strategy = "kfold_nested"
+
+# Object detection settings
+score_threshold = 0.9
+iou_threshold = 0.5
+
+# Classification settings
+target = "OA"
+lateral_mode = "BOTH"
+loss_function = "CE"
+
+rcnn_timestamp = "20260602_232532"
+class_timestamp = "20260604_002325"
