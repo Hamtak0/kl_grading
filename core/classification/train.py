@@ -55,7 +55,7 @@ def train_classification(
 
     (results_dir / "weights").mkdir(exist_ok=True)
     (results_dir / "runs").mkdir(exist_ok=True)
-    (results_dir / "metrics" / "confusion_matrices").mkdir(parents=True, exist_ok=True)
+    (results_dir / "metrics" / "validation_confusion_matrices").mkdir(parents=True, exist_ok=True)
 
     logger = setup_logger(name="Classification Training", log_file=str(results_dir / "densenet_training.log"))
     
