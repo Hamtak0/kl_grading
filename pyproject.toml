@@ -1,7 +1,7 @@
 [project]
 name = "knee-oa"
 version = "0.1.0"
-description = "Add your description here"
+description = "NAIST internship 2026, Biomedical Imaging Intelligence lab"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
