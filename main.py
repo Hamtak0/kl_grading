@@ -14,8 +14,10 @@ import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score, classification_report, balanced_accuracy_score
 
-from dataset_handler import Fold_Handler, KLGradingDataset
-from models import RCNN, Classification_DenseNet
+from core.data.dataset_handler import Fold_Handler, KLGradingDataset
+from core.object_detection.models import RCNN
+from core.classification.models import Classification_DenseNet
+
 from utils.config import load_toml_config
 from utils.dicom_cut import read_dicom_image
 from utils.logger import setup_logger
@@ -38,10 +40,6 @@ def main():
 
     args = parser.parse_args()
 
-    logger = setup_logger(name="Knee Osteoarthritis", log_file="inference.log")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-
     cfg = load_toml_config(args.config)
     target = (args.target if args.target else cfg["inference"]["target"]).upper()
     mode = (args.mode if args.mode else cfg["inference"]["lateral_mode"]).upper()
@@ -53,7 +51,30 @@ def main():
     score_threshold = args.score if args.score is not None else cfg["inference"]["score_threshold"]
     iou_threshold = args.iou if args.iou is not None else cfg["inference"]["iou_threshold"]
 
-    logger.info(f"Active settings -> Target: {target}, Mode: {mode}, Strategy: {strategy}, Timestamp: RCNN {rcnn_ts} & CLS {cls_ts}, Loss function: {loss_fn}")
+    results_dir = Path(f"./results/inference/{rcnn_ts}_{cls_ts}_{strategy}_{target}_{mode}_{loss_fn}")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    (results_dir / "metrics").mkdir(parents=True, exist_ok=True)
+    img_save_dir = results_dir / "images"
+    if img_save_dir.exists():
+        shutil.rmtree(img_save_dir)
+    img_save_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = setup_logger(name="Knee Osteoarthritis Inference", log_file=str(results_dir / "inference.log"))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+
+    logger.info(f"Active settings -> Strategy: {strategy}, Target: {target}, Mode: {mode}, Loss function: {loss_fn}, Timestamp: RCNN {rcnn_ts} & CLS {cls_ts}")
+
+    det_strategy = "kfold" if strategy in ["kfold_blind", "kfold_nested"] else strategy
+
+    det_capsule = Path(f"./results/object_detection/{rcnn_ts}_{det_strategy}")
+    cls_capsule = Path(f"./results/classification/{cls_ts}_{strategy}_{target}_{mode}_{loss_fn}")
+    if not det_capsule.exists():
+        logger.error(f"Detection model capsule not found at {det_capsule}.")
+        sys.exit(1)
+    if not cls_capsule.exists():
+        logger.error(f"Classification model capsule not found at {cls_capsule}.")
+        sys.exit(1)
 
     env_cfg = load_toml_config(Path("configs/config.toml"))
     try:
@@ -68,13 +89,7 @@ def main():
 
     fold_handler = Fold_Handler(dataset)
     all_folds = fold_handler.get_all_folds()
-
     cls_transform = get_transform(rotation=0, jitter=0, sharpness=0, is_train=False).to(device)
-
-    output_dir = Path(f"./outputs/{rcnn_ts}_{cls_ts}_{target}_{mode}_{strategy}_{loss_fn}/")
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     all_true = []
     all_pred = []
@@ -87,12 +102,12 @@ def main():
         logger.info(f"{'-' * 20} Evaluating test fold: {test_fold} {'-' * 20}")
 
         det_model = RCNN(num_classes=3).to(device)
-        det_weight = Path(f"./weights/knee_rcnn_{rcnn_ts}_fold{test_fold}.pth")
+        det_weight = det_capsule / "weights" / f"fold{test_fold}.pth"
         try:
             det_model.load_state_dict(torch.load(det_weight, map_location=device, weights_only=True))
             det_model.eval()
         except Exception as e:
-            logger.error(f"Failed to load detection model weights for fold {test_fold}: {e}")
+            logger.error(f"Failed to load detection model weights for fold {test_fold} at {det_weight}: {e}")
             continue
 
         if target == "OA":
@@ -106,14 +121,14 @@ def main():
             logger.info("Loading for single holdout strategy")
             for fold in fold_handler.get_cv_folds():
                 model = Classification_DenseNet(num_classes=num_classes).to(device)
-                weight_path = Path(f"./weights/knee_class_{cls_ts}_{target}_fold{fold}_{mode}.pth")
+                weight_path = cls_capsule / "weights" / f"fold{fold}.pth"
                 if weight_path.exists():
                     model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
                     model.eval()
                     cls_models.append(model)
         else:
             model = Classification_DenseNet(num_classes=num_classes).to(device)
-            weight_path = Path(f"./weights/knee_class_{cls_ts}_{target}_fold{test_fold}_{mode}.pth")
+            weight_path = cls_capsule / "weights" / f"fold{test_fold}.pth"
             if weight_path.exists():
                 model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
                 model.eval()
@@ -234,7 +249,7 @@ def main():
                     title = f"{side_str} ({score:.2f})\n{target} True: {true_text} Pred: {pred_text} ({confidence:.2%})"
                     draw_box(ax, color=box_color, title=title, box=box.cpu().numpy())
 
-                out_path = output_dir / f"{patient_id}_fold{test_fold}.png"
+                out_path = img_save_dir / f"{patient_id}_fold{test_fold}.png"
                 fig.savefig(out_path, bbox_inches="tight", dpi=300)
                 plt.close(fig)
 
@@ -273,7 +288,7 @@ def main():
 
         cm_title = f"Full pipeline {target} ({strategy})\nAcc: {acc:.2%}, Bal Acc: {bal_acc:.2%}, F1: {f1:.4f}"
         fig_cm = create_confusion_matrix_figure(all_true, all_pred, target=target, title=cm_title)
-        cm_path = output_dir / f"confusion_matrix_{target}.png"
+        cm_path = results_dir / "metrics" / f"confusion_matrix_{target}.png"
         fig_cm.savefig(cm_path, bbox_inches="tight", dpi=300)
         plt.close(fig_cm)
 
@@ -286,10 +301,10 @@ def main():
         })
         results_df['Correct'] = results_df[f'True {target}'] == results_df[f'Predicted {target}']
         
-        csv_path = output_dir / f"table_{target}.csv"
+        csv_path = results_dir / "metrics" / f"table_{target}.csv"
         results_df.to_csv(csv_path, index=False)
         
-        logger.info(f"Metrics complete! Matrix and CSV saved to {output_dir}")
+        logger.info(f"Metrics complete! Matrix and CSV saved to {results_dir / 'metrics'}")
     else:
         logger.warning("No ground truth labels were found. Skipping metrics.")
 
